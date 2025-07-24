@@ -1,0 +1,10 @@
+# Ignore virtual environment
+mediaenv311/
+__pycache__/
+*.pyc
+*.log
+*.tmp
+*.db
+*.sqlite3
+*.env
+.DS_Store

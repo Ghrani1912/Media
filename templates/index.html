@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Media Analyzer</title>
+</head>
+<body>
+    <h2>Media Analyzer</h2>
+
+    {% if success %}
+        <p style="color:green;">{{ success }}</p>
+    {% endif %}
+    {% if error %}
+        <p style="color:red;">{{ error }}</p>
+    {% endif %}
+
+    <form method="POST" enctype="multipart/form-data">
+        <label>Paste YouTube/Twitch Link:</label><br>
+        <input type="text" name="link" style="width: 400px;"><br><br>
+
+        <label>Or Upload Video File:</label><br>
+        <input type="file" name="file"><br><br>
+
+        <button type="submit">Analyze</button>
+    </form>
+</body>
+</html>
