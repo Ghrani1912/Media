@@ -26,6 +26,7 @@ from openpyxl import Workbook, load_workbook
 from textblob import TextBlob
 
 import ads
+import served_ads
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +42,14 @@ REPORT_PATH = os.environ.get(
 REPORT_HEADERS = [
     "Platform", "Link/File", "Transcript", "Sentiment", "Keywords",
     "Ads Detected", "Ad Time (s)", "Ad Details",
+    "Served Ads", "Served Ad Details",
 ]
+
+# Served-ad capture drives a real browser, so it is opt-in. Enable it with
+# CAPTURE_SERVED_ADS=1 (or the UI checkbox when analyzing a YouTube link).
+CAPTURE_SERVED_ADS = os.environ.get("CAPTURE_SERVED_ADS", "").strip().lower() in {
+    "1", "true", "yes"
+}
 
 # Audio extensions that need no ffmpeg conversion.
 _READY_AUDIO_EXT = {".mp3", ".wav", ".m4a", ".flac", ".ogg"}
@@ -310,6 +318,7 @@ def save_to_excel(
     sentiment: float,
     keywords,
     ad_report: dict | None = None,
+    served_report: dict | None = None,
     path: str = REPORT_PATH,
 ) -> str:
     """Append one analysis row to the Excel report, creating it if needed."""
@@ -319,6 +328,8 @@ def save_to_excel(
         keywords_value = str(keywords)
 
     ad_report = ad_report or {}
+    served_report = served_report or {}
+    served = served_report.get("ads") or []
     row = [
         platform,
         target,
@@ -328,6 +339,8 @@ def save_to_excel(
         ad_report.get("ad_count", 0),
         ad_report.get("ad_seconds", 0),
         ads.format_segments(ad_report.get("segments") or []),
+        served_report.get("ad_count", 0),
+        served_ads.format_served_ads(served),
     ]
 
     with _REPORT_LOCK:
@@ -349,11 +362,21 @@ def save_to_excel(
 
 def process_video(link: str | None = None, file_path: str | None = None,
                   keep_temp: bool = False, report_path: str = REPORT_PATH,
-                  model_name: str | None = None, language: str | None = None) -> dict:
+                  model_name: str | None = None, language: str | None = None,
+                  capture_served: bool | None = None,
+                  served_watch_seconds: float | None = None,
+                  proof_dir: str | None = None) -> dict:
     """Run the full pipeline and return a summary dict.
 
     Provide exactly one of ``link`` (remote URL) or ``file_path`` (local media).
+
+    ``capture_served`` enables the live served-ad capture for YouTube links: a
+    real Chrome is driven to watch the video and record the ads YouTube actually
+    plays (the pre-roll/mid-roll spots behind the yellow progress bar). It is off
+    by default because it opens a browser and takes ``served_watch_seconds``.
     """
+    if capture_served is None:
+        capture_served = CAPTURE_SERVED_ADS
     temp_files: list[str] = []
 
     if link:
@@ -376,11 +399,28 @@ def process_video(link: str | None = None, file_path: str | None = None,
     transcript = result["text"]
     sentiment, keywords = analyze_text(transcript)
 
+    served_report: dict | None = None
+    if capture_served and link:
+        try:
+            served_report = served_ads.capture_served_ads(
+                link,
+                watch_seconds=served_watch_seconds,
+                proof_dir=proof_dir,
+                video_id=ads.extract_video_id(link),
+            )
+        except Exception as exc:  # capture must never break the pipeline
+            logger.warning("Served-ad capture failed: %s", exc)
+            served_report = {
+                "available": False, "captured": False, "ads": [], "ad_count": 0,
+                "ad_seconds": 0.0, "note": f"Served-ad capture failed: {exc}",
+            }
+
     try:
         ad_report = ads.detect_ads(
             link=link,
             transcript_segments=result["segments"],
             transcript=transcript,
+            served_ads_report=served_report,
         )
     except Exception as exc:  # ad detection must never break the pipeline
         logger.warning("Ad detection failed: %s", exc)
@@ -390,7 +430,8 @@ def process_video(link: str | None = None, file_path: str | None = None,
         }
 
     save_to_excel(platform, target, transcript, sentiment, keywords,
-                  ad_report=ad_report, path=report_path)
+                  ad_report=ad_report, served_report=served_report,
+                  path=report_path)
 
     if not keep_temp:
         for tmp in temp_files:
@@ -409,6 +450,7 @@ def process_video(link: str | None = None, file_path: str | None = None,
         "model": model_name or WHISPER_MODEL,
         "language": result.get("language"),
         "ads": ad_report,
+        "served": served_report or ad_report.get("served") or {},
     }
     logger.info("Analysis complete: %s", os.path.basename(str(target)))
     return summary

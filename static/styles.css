@@ -137,4 +137,22 @@ ul.ads li {
   text-transform: uppercase;
   letter-spacing: .02em;
 }
-.src { margin-left: auto; color: var(--muted); font-size: .75rem; }
+.src { margin-left: auto; color: var(--muted); font-size: .75rem; text-align: right; }
+
+label.checkbox {
+  display: flex;
+  align-items: flex-start;
+  gap: .55rem;
+  margin-top: 1.25rem;
+  font-weight: 500;
+  font-size: .88rem;
+  cursor: pointer;
+}
+label.checkbox input { margin-top: .2rem; accent-color: var(--accent); }
+.hint { color: var(--muted); font-weight: 400; font-size: .78rem; display: block; }
+label.checkbox .checkbox-body { display: block; }
+h4 .hint { display: inline; }
+ul.ads li { flex-wrap: wrap; }
+.ad-when, .ad-proof { flex-basis: 100%; margin-left: 1.35rem; }
+.ad-proof code, .report-note code { word-break: break-all; font-size: .85em; }
+

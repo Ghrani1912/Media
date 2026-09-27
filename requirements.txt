@@ -9,6 +9,22 @@
 #   WHISPER_MODEL=small|medium|large   transcription accuracy (default: small)
 #   YTDLP_COOKIES=/path/cookies.txt    authenticate when YouTube blocks the bot
 #   YTDLP_COOKIES_FROM_BROWSER=chrome  read cookies straight from a browser
+#   CAPTURE_SERVED_ADS=1               watch videos in Chrome to record served ads
+#   SERVED_ADS_FULL=1                  play the whole video in real time instead
+#                                      of sweeping (exact but slow)
+#   SERVED_ADS_SECONDS=60              cap the capture to a fixed window instead
+#   SERVED_ADS_SEEK_STEP=120           seconds jumped between sweep stops
+#   SERVED_ADS_SEEK_DWELL=14           seconds parked at each sweep stop
+#   SERVED_ADS_MAX_SECONDS=900         hard ceiling for one capture
+#   SERVED_ADS_PROOF_DIR=./proof       where ad clips/manifests are written
+#   SERVED_ADS_RECORD=0                skip saving proof clips
+#   SERVED_ADS_HEADLESS=1              run the capture browser headless (ads may
+#                                      not be served to headless Chrome)
+#   CHROME_BINARY=/path/to/chrome      explicit Chrome/Edge path for the capture
+#
+# Real (served) YouTube ads are captured by driving a local Chrome through
+# selenium, so Google Chrome (or Edge) must be installed. Selenium downloads a
+# matching driver on first use. Install with: pip install selenium
 #
 # openai-whisper pulls in numba, which requires NumPy <= 2.2; pin NumPy
 # accordingly or Whisper will fail to import.
@@ -18,3 +34,4 @@ openai-whisper>=20240930
 numpy<2.2
 textblob>=0.18
 openpyxl>=3.1
+selenium>=4.20

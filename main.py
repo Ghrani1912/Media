@@ -65,12 +65,14 @@ def index():
     link = (request.form.get("link") or "").strip()
     file = request.files.get("file")
     model = (request.form.get("model") or "").strip()
+    capture_served = bool(request.form.get("capture_served"))
     if model not in ALLOWED_MODELS:
         model = None  # fall back to the configured default
 
     try:
         if link:
-            result = process_video(link=link, model_name=model)
+            result = process_video(link=link, model_name=model,
+                                   capture_served=capture_served)
         elif file and file.filename:
             if not allowed_file(file.filename):
                 return render_template(

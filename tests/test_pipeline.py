@@ -138,6 +138,27 @@ def test_save_to_excel_writes_ad_columns(tmp_path):
     assert ws.cell(2, 8).value == "sponsor 490-546s; sponsor 708-723s"
 
 
+def test_save_to_excel_writes_served_ad_columns(tmp_path):
+    from openpyxl import load_workbook
+
+    report = tmp_path / "r.xlsx"
+    served = {
+        "ad_count": 1,
+        "ads": [{
+            "placement": "pre-roll", "advertiser": "Kurkure India",
+            "destination": "instagram.com", "cta": "Know more!",
+            "duration": 20.0, "skippable": True, "skip_after_s": 5.0,
+            "summary": "Kurkure India -> instagram.com (Know more!) 20s skippable after 5.0s",
+        }],
+    }
+    process.save_to_excel("YouTube", "u", "t", 0.1, ["k"], served_report=served,
+                          path=str(report))
+    ws = load_workbook(str(report)).active
+    assert ws.cell(1, 9).value == "Served Ads"
+    assert ws.cell(2, 9).value == 1
+    assert "Kurkure India" in ws.cell(2, 10).value
+
+
 def test_save_to_excel_migrates_old_report_headers(tmp_path):
     """A report written by an older version must be extended, not corrupted."""
     from openpyxl import Workbook, load_workbook
@@ -219,6 +240,51 @@ def test_process_video_link_downloads_and_cleans_up(fake_model, monkeypatch, tmp
     assert summary["platform"] == "YouTube"
     # temp download removed when keep_temp is False
     assert not downloaded.exists()
+
+
+def test_process_video_captures_served_ads(monkeypatch, fake_model, tmp_path):
+    downloaded = tmp_path / "yt.mp3"
+    downloaded.write_bytes(b"x")
+    monkeypatch.setattr(process, "download_youtube_audio", lambda url: str(downloaded))
+    monkeypatch.setattr(process.ads, "fetch_sponsor_segments",
+                        lambda vid, timeout=15.0: [])
+    monkeypatch.setattr(process.ads, "fetch_ad_breaks",
+                        lambda vid, timeout=20.0: None)
+
+    captured = {
+        "available": True, "captured": True, "ad_count": 1, "ad_seconds": 20.0,
+        "ads": [{"advertiser": "Kurkure India", "placement": "pre-roll",
+                 "duration": 20.0, "summary": "Kurkure India 20s"}],
+        "note": "Captured 1 served ad(s) totalling 20.0s from a live Chrome session.",
+    }
+    monkeypatch.setattr(process.served_ads, "capture_served_ads",
+                        lambda url, **kwargs: captured)
+
+    summary = process.process_video(
+        link="https://youtu.be/jNQXAC9IVRw", capture_served=True,
+        report_path=str(tmp_path / "r.xlsx"),
+    )
+    assert summary["served"]["ad_count"] == 1
+    assert summary["ads"]["served_ad_count"] == 1
+
+
+def test_process_video_survives_served_capture_failure(monkeypatch, fake_model, tmp_path):
+    downloaded = tmp_path / "yt.mp3"
+    downloaded.write_bytes(b"x")
+    monkeypatch.setattr(process, "download_youtube_audio", lambda url: str(downloaded))
+    monkeypatch.setattr(process.ads, "fetch_sponsor_segments",
+                        lambda vid, timeout=15.0: [])
+    monkeypatch.setattr(process.ads, "fetch_ad_breaks",
+                        lambda vid, timeout=20.0: None)
+    monkeypatch.setattr(process.served_ads, "capture_served_ads",
+                        lambda url, **kwargs: (_ for _ in ()).throw(RuntimeError("no chrome")))
+
+    summary = process.process_video(
+        link="https://youtu.be/jNQXAC9IVRw", capture_served=True,
+        report_path=str(tmp_path / "r.xlsx"),
+    )
+    assert summary["served"]["ad_count"] == 0
+    assert "failed" in summary["served"]["note"].lower()
 
 
 def test_process_video_requires_input():
@@ -320,6 +386,64 @@ def test_post_upload_shows_result(client):
     assert r.status_code == 200
     assert "hello world" in body
     assert "<dd>base</dd>" in body
+
+
+def test_post_renders_served_ads_and_ad_breaks(monkeypatch, client):
+    import main
+
+    seen = {}
+
+    def _fake_process(**kwargs):
+        seen.update(kwargs)
+        return {
+            "platform": "YouTube", "target": "http://x", "transcript": "hi",
+            "sentiment": 0.1, "keywords": ["hi"], "report": "r.xlsx",
+            "model": "small",
+            "ads": {
+                "ad_count": 0, "ad_seconds": 0, "segments": [],
+                "note": "No ad segments detected.",
+                "ad_breaks": {
+                    "checked": True, "monetized": True,
+                    "breaks": [
+                        {"kind": "START", "placement": "pre-roll", "start": 0.0},
+                        {"kind": "MID", "placement": "mid-roll", "start": 470.0},
+                    ],
+                    "note": "YouTube schedules 2 ad break(s).",
+                },
+            },
+            "served": {
+                "available": True, "captured": True, "ad_count": 1,
+                "ad_seconds": 20.0, "note": "Captured 1 served ad(s).",
+                "ads": [{
+                    "advertiser": "Kurkure India", "destination": "instagram.com",
+                    "cta": "Know more!", "duration": 20.0, "placement": "pre-roll",
+                    "ad_index": 1, "ad_pod_size": 2, "skippable": True,
+                    "skip_after_s": 5.0, "summary": "Kurkure India -> instagram.com",
+                    "content_position": 312.0, "content_duration": 1661.0,
+                    "wall_started_at": "2026-09-27T12:00:05", "elapsed_s": 120.0,
+                    "trigger": "seek@300", "clip": "proof/x_ad01.mp4",
+                    "thumbnail": "proof/x_ad01_thumb.png",
+                }],
+                "manifest": "proof/x_manifest.json",
+                "strategy": "sweep",
+            },
+        }
+
+    monkeypatch.setattr(main, "process_video", _fake_process)
+    r = client.post("/", data={"link": "http://x", "capture_served": "1"})
+    body = r.data.decode()
+    assert r.status_code == 200
+    assert seen.get("capture_served") is True
+    assert "Kurkure India" in body
+    assert "instagram.com" in body
+    assert "Ad break schedule" in body
+    assert "pre-roll" in body and "mid-roll" in body
+    assert "ad 1 of 2" in body
+    # timeline + wall clock + proof clip are all surfaced
+    assert "5:12 of 27:41" in body
+    assert "2026-09-27T12:00:05" in body
+    assert "proof/x_ad01.mp4" in body
+    assert "proof/x_manifest.json" in body
 
 
 def test_post_invalid_model_falls_back(client):

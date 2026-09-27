@@ -19,3 +19,6 @@ yt_audio.*
 audio.wav
 media_report.xlsx
 uploads/
+
+# Served-ad proof clips, thumbnails and manifests
+proof/
