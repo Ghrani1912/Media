@@ -1,0 +1,20 @@
+# Core runtime dependencies for the Media Analyzer.
+#
+# System requirements (not installable via pip):
+#   * ffmpeg on PATH  -- required for audio extraction and yt-dlp post-processing
+#   * a JavaScript runtime (Deno, Node, or Bun) on PATH -- recent yt-dlp versions
+#     need one for YouTube format extraction; without it downloads fail.
+#
+# Optional environment variables:
+#   WHISPER_MODEL=small|medium|large   transcription accuracy (default: small)
+#   YTDLP_COOKIES=/path/cookies.txt    authenticate when YouTube blocks the bot
+#   YTDLP_COOKIES_FROM_BROWSER=chrome  read cookies straight from a browser
+#
+# openai-whisper pulls in numba, which requires NumPy <= 2.2; pin NumPy
+# accordingly or Whisper will fail to import.
+flask>=3.0
+yt-dlp>=2026.8.19
+openai-whisper>=20240930
+numpy<2.2
+textblob>=0.18
+openpyxl>=3.1

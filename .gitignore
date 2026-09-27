@@ -1,10 +1,21 @@
-# Ignore virtual environment
+# Virtual environment
 mediaenv311/
+venv/
+.venv/
+
+# Python
 __pycache__/
 *.pyc
+.pytest_cache/
 *.log
 *.tmp
 *.db
 *.sqlite3
 *.env
 .DS_Store
+
+# Pipeline artifacts (generated audio, reports, uploads)
+yt_audio.*
+audio.wav
+media_report.xlsx
+uploads/

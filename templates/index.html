@@ -1,26 +1,90 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Media Analyzer</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
 </head>
 <body>
-    <h2>Media Analyzer</h2>
+    <main class="card">
+        <h2>Media Analyzer</h2>
+        <p class="subtitle">Transcribe and analyze the sentiment of a video or audio source.</p>
 
-    {% if success %}
-        <p style="color:green;">{{ success }}</p>
-    {% endif %}
-    {% if error %}
-        <p style="color:red;">{{ error }}</p>
-    {% endif %}
+        {% if error %}
+            <p class="alert error">{{ error }}</p>
+        {% endif %}
 
-    <form method="POST" enctype="multipart/form-data">
-        <label>Paste YouTube/Twitch Link:</label><br>
-        <input type="text" name="link" style="width: 400px;"><br><br>
+        <form method="POST" enctype="multipart/form-data">
+            <label for="link">Paste a YouTube / Twitch link</label>
+            <input id="link" type="text" name="link" placeholder="https://...">
 
-        <label>Or Upload Video File:</label><br>
-        <input type="file" name="file"><br><br>
+            <div class="divider"><span>or</span></div>
 
-        <button type="submit">Analyze</button>
-    </form>
+            <label for="file">Upload a media file</label>
+            <input id="file" type="file" name="file"
+                   accept="video/*,audio/*,.mp4,.mov,.avi,.mkv,.webm,.m4a,.mp3,.wav">
+
+            <label for="model" class="model-label">Transcription accuracy</label>
+            <select id="model" name="model">
+                {% for m in models %}
+                    <option value="{{ m }}" {% if m == selected_model %}selected{% endif %}>
+                        {{ m }}{% if m == default_model %} (default){% elif m == 'medium' %} (more accurate, slower){% elif m == 'large' %} (most accurate, slowest){% endif %}
+                    </option>
+                {% endfor %}
+            </select>
+
+            <button type="submit">Analyze</button>
+        </form>
+
+        {% if result %}
+            <section class="result">
+                <h3>Result</h3>
+                <dl>
+                    <dt>Source</dt>
+                    <dd>{{ result.platform }} — {{ result.target }}</dd>
+                    <dt>Model</dt>
+                    <dd>{{ result.model }}</dd>
+                    <dt>Sentiment</dt>
+                    <dd>{{ '%.3f'|format(result.sentiment) }}
+                        {% if result.sentiment > 0 %} (positive)
+                        {% elif result.sentiment < 0 %} (negative)
+                        {% else %} (neutral){% endif %}
+                    </dd>
+                    <dt>Keywords</dt>
+                    <dd>{{ result.keywords | join(', ') or '—' }}</dd>
+                    <dt>Ads</dt>
+                    <dd>
+                        {% if result.ads %}
+                            {{ result.ads.ad_count }} segment(s), {{ result.ads.ad_seconds }}s
+                        {% else %}
+                            —
+                        {% endif %}
+                    </dd>
+                </dl>
+
+                {% if result.ads %}
+                    <h4>Ads &amp; sponsors</h4>
+                    <p class="report-note">{{ result.ads.note }}</p>
+                    {% if result.ads.segments %}
+                        <ul class="ads">
+                            {% for s in result.ads.segments %}
+                                <li>
+                                    <span class="badge">{{ s.category }}</span>
+                                    {{ '%d:%02d'|format((s.start // 60)|int, (s.start % 60)|int) }}
+                                    &ndash;
+                                    {{ '%d:%02d'|format((s.end // 60)|int, (s.end % 60)|int) }}
+                                    <span class="src">{{ '%.1f'|format(s.duration) }}s &middot; {{ s.source }}</span>
+                                </li>
+                            {% endfor %}
+                        </ul>
+                    {% endif %}
+                {% endif %}
+                <h4>Transcript</h4>
+                <p class="transcript">{{ result.transcript or '(no speech detected)' }}</p>
+                <p class="report-note">Saved to <code>{{ report }}</code></p>
+            </section>
+        {% endif %}
+    </main>
 </body>
 </html>
