@@ -338,6 +338,9 @@ def client(monkeypatch):
             "keywords": ["hello"],
             "report": "r.xlsx",
             "model": kwargs.get("model_name") or "small",
+            "ads": {"ad_count": 0, "ad_seconds": 0, "segments": [],
+                    "note": "No ad segments detected."},
+            "served": {"ad_count": 0, "ads": [], "note": ""},
         },
     )
     main.app.config.update(TESTING=True)
@@ -347,15 +350,20 @@ def client(monkeypatch):
 def test_index_get(client):
     r = client.get("/")
     assert r.status_code == 200
-    assert b'<select id="model"' in r.data
+    body = r.data.decode()
+    # the form fields Flask reads by name must survive any redesign
+    assert 'name="link"' in body
+    assert 'name="file"' in body
+    assert 'name="model"' in body
+    assert 'name="capture_served"' in body
 
 
 def test_default_model_is_marked_selected(client):
     import main
 
     body = client.get("/").data.decode()
-    needle = f'value="{main.WHISPER_MODEL}" selected'
-    assert needle in body, f"default model not selected in dropdown: {needle}"
+    needle = f'name="model" value="{main.WHISPER_MODEL}" checked'
+    assert needle in body, f"default model not selected in segmented control: {needle}"
 
 
 def test_health(client):
@@ -364,7 +372,7 @@ def test_health(client):
 
 def test_post_no_input(client):
     r = client.post("/", data={})
-    assert r.status_code == 200
+    assert r.status_code == 400
     assert b"Provide a YouTube" in r.data
 
 
@@ -385,7 +393,7 @@ def test_post_upload_shows_result(client):
     body = r.data.decode()
     assert r.status_code == 200
     assert "hello world" in body
-    assert "<dd>base</dd>" in body
+    assert "MODEL: <span>base</span>" in body  # the model used, in the meta line
 
 
 def test_post_renders_served_ads_and_ad_breaks(monkeypatch, client):
@@ -436,13 +444,13 @@ def test_post_renders_served_ads_and_ad_breaks(monkeypatch, client):
     assert seen.get("capture_served") is True
     assert "Kurkure India" in body
     assert "instagram.com" in body
-    assert "Ad break schedule" in body
+    assert "Scheduled ad breaks" in body
     assert "pre-roll" in body and "mid-roll" in body
     assert "ad 1 of 2" in body
-    # timeline + wall clock + proof clip are all surfaced
+    # hour-aware video timeline position (5:12 of 27:41) and the wall clock
     assert "5:12 of 27:41" in body
     assert "2026-09-27T12:00:05" in body
-    assert "proof/x_ad01.mp4" in body
+    # the manifest path is linked even though the fake report has no proof dir
     assert "proof/x_manifest.json" in body
 
 
@@ -452,7 +460,7 @@ def test_post_invalid_model_falls_back(client):
         data={"file": (io.BytesIO(b"abc"), "clip.mp3"), "model": "godzilla"},
         content_type="multipart/form-data",
     )
-    assert "<dd>small</dd>" in r.data.decode()
+    assert "MODEL: <span>small</span>" in r.data.decode()
 
 
 def test_uploaded_file_is_deleted(tmp_path, monkeypatch, client):
@@ -605,12 +613,12 @@ def test_post_renders_a_twitch_capture(monkeypatch, client):
     assert "ssai stitched in-stream" in body    # the ad format
     assert "ad 1 of 1" in body
     assert "proof/gon_vl_manifest.json" in body
+    assert "1:00:06 of 1:02:05" in body           # hour-aware timeline position
 
 
 # The web UI renders a served ad field by field, so anything the capture starts
-# reporting has to be added there too. These three record what a Twitch capture
-# knows but the UI does not put on the page yet; they start passing as soon as it
-# does (pytest reports XPASS, not a failure).
+# reporting has to be added there too. These three pin the fields that used to
+# be missing from the old UI (they were xfails until the Broadcast Log sheet).
 def _post_twitch(monkeypatch, client, report=None):
     import main
 
@@ -629,7 +637,6 @@ def _post_twitch(monkeypatch, client, report=None):
     return client.post("/", data={"link": "https://www.twitch.tv/gon_vl"}).data.decode()
 
 
-@pytest.mark.xfail(reason="the UI does not surface the creative registry/gallery yet")
 def test_post_links_to_the_twitch_creative_gallery(monkeypatch, client):
     body = _post_twitch(monkeypatch, client)
     assert "proof/creatives.html" in body
@@ -637,7 +644,6 @@ def test_post_links_to_the_twitch_creative_gallery(monkeypatch, client):
     assert "2 times" in body
 
 
-@pytest.mark.xfail(reason="the UI lists fields, never the ad's own summary line")
 def test_post_shows_a_labelled_twitch_creative(monkeypatch, client):
     report = _twitch_served_report()
     report["ads"][0]["known_label"] = "Amazon deals"
@@ -647,10 +653,26 @@ def test_post_shows_a_labelled_twitch_creative(monkeypatch, client):
     body = _post_twitch(monkeypatch, client, report)
     assert "amazon.in" in body  # the parts that are shown today
     assert "Amazon deals" in body
+    assert "identified as Amazon deals via amazon.in 30s" in body
 
 
-@pytest.mark.xfail(reason="the UI shows boundary frames only, not the decoded ad frames")
 def test_post_shows_the_decoded_ad_frames(monkeypatch, client):
     body = _post_twitch(monkeypatch, client)
     assert "proof/gon_vl_ad01_1_start.png" in body
     assert "stream-frames" in body  # how much evidence there is, and from where
+
+
+def test_post_twitch_proof_images_are_served_over_http(monkeypatch, client, tmp_path):
+    """Frame PNGs under proof/ must be fetchable for the report's <img>."""
+    import main
+    import served_ads as served_ads_module
+
+    proof = tmp_path / "proof"
+    proof.mkdir()
+    (proof / "gon_vl_ad01_1_start.png").write_bytes(b"fake-png")
+    monkeypatch.setattr(served_ads_module, "DEFAULT_PROOF_DIR", str(proof))
+
+    r = client.get("/proof/gon_vl_ad01_1_start.png")
+    assert r.status_code == 200
+    assert r.data == b"fake-png"
+    assert client.get("/proof/../main.py").status_code in (403, 404)

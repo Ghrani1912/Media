@@ -352,6 +352,27 @@ def _slug(value: str | None, fallback: str = "ad") -> str:
     return text[:40] or fallback
 
 
+def fallback_title(url: str) -> str:
+    """Short human label for a link when no video title can be probed.
+
+    Twitch: the channel login. YouTube: the 11-char video id. Anything else:
+    the URL's path tail. Only shapes the report's headline — never used for
+    lookups.
+    """
+    platform = detect_platform(url)
+    if platform == "twitch":
+        import twitch_ads  # local import: twitch_ads imports this module
+
+        return twitch_ads.twitch_target(url)[1] or url
+    import ads  # local import: ads.py imports this module's format helpers
+
+    video_id = ads.extract_video_id(url)
+    if video_id:
+        return video_id
+    tail = urllib.parse.urlparse(url).path.rstrip("/").rsplit("/", 1)[-1]
+    return tail or url
+
+
 class _ClipRecorder:
     """Films the player every poll and stitches labelled proof frames.
 

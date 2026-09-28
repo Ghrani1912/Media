@@ -13,11 +13,13 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 import subprocess
 import tempfile
 import threading
 import time
+import urllib.parse
 import uuid
 
 import whisper
@@ -72,6 +74,23 @@ def _served_window() -> float | None:
 # Audio extensions that need no ffmpeg conversion.
 _READY_AUDIO_EXT = {".mp3", ".wav", ".m4a", ".flac", ".ogg"}
 
+# Transcript segments that sound like an ad read are highlighted in the UI.
+_AD_TEXT_RE = re.compile(
+    r"\b("
+    r"sponsor(?:ed|ship)?\s+by"
+    r"|thanks\s+to\s+(?:today'?s|this|our)"
+    r"|brought\s+to\s+you\s+by"
+    r"|promo\s*code|use\s+code|discount\s+code"
+    r"|check\s+out|sign\s+up\s+at|link\s+in\s+the\s+description"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _is_ad_like_text(text: str) -> bool:
+    """Heuristic: does this transcript segment read like a sponsor mention?"""
+    return bool(_AD_TEXT_RE.search(text or ""))
+
 # Whisper model used for transcription. "base" is small but noticeably wrong on
 # music/noisy audio; "small" is a much better default. Override with WHISPER_MODEL.
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "small")
@@ -89,6 +108,28 @@ _MODEL_CACHE: dict[str, object] = {}
 # avoid two requests corrupting the report.
 _REPORT_LOCK = threading.Lock()
 
+# Live pipeline stages, published for the web UI's progress readout. Keys are
+# job ids (``uuid4`` hex from main.py), values {"stage": str, "started": float,
+# "detail": str}. ``stage`` is one of fetch/transcribe/ads/done/error. Anything
+# UI-side must treat unknown stages as benign and keep the previous label.
+_STAGE_LOCK = threading.Lock()
+_JOB_STAGES: dict[str, dict] = {}
+
+
+def report_stage(job_id: str | None, stage: str, detail: str = "") -> None:
+    """Publish the current pipeline stage for ``job_id`` (no-op without one)."""
+    if not job_id:
+        return
+    with _STAGE_LOCK:
+        _JOB_STAGES[job_id] = {"stage": stage, "detail": detail,
+                               "updated": time.time()}
+
+
+def pop_stage(job_id: str) -> dict | None:
+    """Consume and clear the latest stage for ``job_id`` (read by the poller)."""
+    with _STAGE_LOCK:
+        return _JOB_STAGES.pop(job_id, None)
+
 
 def _js_runtimes() -> dict:
     """Return installed JS runtimes for yt-dlp.
@@ -102,6 +143,147 @@ def _js_runtimes() -> dict:
         if path:
             runtimes[name] = {"path": path}
     return runtimes
+
+
+def _enrich_served_ads(served_report: dict | None) -> None:
+    """Attach ready-to-render fields (``_ui``) to every captured served ad.
+
+    The capture readers store proof paths as filesystem paths; the web UI needs
+    URLs it can link to, an ordinal badge, and the creative identity in one
+    place. Everything is optional — a failed or partial capture renders with
+    whatever it has.
+    """
+    if not served_report:
+        return
+    base = served_report.get("proof_dir") or ""
+    for i, ad in enumerate(served_report.get("ads") or [], start=1):
+        ui: dict = {
+            "ordinal": ad.get("ordinal") or ad.get("ad_index") or i,
+        }
+
+        def _url(value: str | None) -> str | None:
+            if not value:
+                return None
+            if base and value.startswith(base):
+                tail = value[len(base):].lstrip("\\/").replace("\\", "/")
+                return f"/proof/{tail}"
+            return None
+
+        frames = []
+        for key, label in (("frame_start", "FRAME START"), ("frame_mid", "FRAME MID"),
+                           ("frame_end", "FRAME END"), ("frame_before", "BEFORE"),
+                           ("frame_after", "AFTER")):
+            path = ad.get(key)
+            if path:
+                frames.append({"label": label, "url": _url(path) or path, "path": path})
+        ui["frame_urls"] = frames
+        ui["frame_paths"] = [f["path"] for f in frames]
+        ui["thumb_url"] = _url(ad.get("frame_start") or ad.get("frame_mid")
+                               or ad.get("thumbnail"))
+        clip = ad.get("clip")
+        ui["clip_url"] = _url(clip) if clip else None
+        manifest = served_report.get("manifest")
+        ui["manifest_url"] = _url(manifest) if manifest else None
+        index = served_report.get("index")
+        ui["index_url"] = _url(index) if index else None
+        creatives = served_report.get("creatives_index")
+        ui["creatives_index_url"] = _url(creatives) if creatives else None
+        ad["_ui"] = ui
+
+
+def _build_timeline(link: str | None, ads_report: dict | None,
+                    served_report: dict | None) -> dict | None:
+    """Percent-positioned marks for the report's timeline bar.
+
+    Serves the web UI only — the Excel report already carries the raw numbers.
+    """
+    if not link:
+        return None
+    ads_report = ads_report or {}
+    served_report = served_report or {}
+
+    break_starts = [float(b.get("start") or 0.0)
+                    for b in (ads_report.get("ad_breaks") or {}).get("breaks") or []]
+    spans = [(float(s.get("start") or 0.0), float(s.get("end") or 0.0),
+              s.get("category") or "sponsor")
+             for s in ads_report.get("segments") or []]
+    served_end = max(
+        [float(a.get("content_position") or 0) + float(a.get("duration") or 0)
+         for a in served_report.get("ads") or [] if a.get("content_duration")]
+        or [0.0],
+    )
+
+    ends = [b + 60.0 for b in break_starts]
+    ends += [end for _, end, _ in spans if end > 0]
+    ends.append(served_end)
+    total = max(ends + [60.0])
+
+    def _pct(seconds: float) -> float:
+        return min(100.0, max(0.0, seconds / total * 100.0))
+
+    ticks = [{"left": _pct(b), "label": served_ads.format_timeline(b),
+              "placement": "scheduled break"}
+             for b in break_starts]
+
+    sponsors = []
+    for start, end, category in spans:
+        if end <= start:
+            continue
+        sponsors.append({
+            "left": _pct(start),
+            "width": max(0.5, _pct(end) - _pct(start)),
+            "label": f"{category} {served_ads.format_timeline(start)} - "
+                     f"{served_ads.format_timeline(end)}",
+        })
+
+    if not ticks and not sponsors:
+        return None
+    return {"total": total, "ticks": ticks, "sponsors": sponsors}
+
+
+def _build_transcript_view(segments, ads_report: dict | None,
+                           served_report: dict | None) -> list[dict] | None:
+    """Timestamped transcript entries, flagged where an ad read happens.
+
+    A segment is flagged when it overlaps a SponsorBlock sponsor span, a
+    scheduled ad-break slot, or a served ad that interrupted at that moment —
+    and otherwise when its own words read like a sponsor mention.
+    """
+    entries = []
+    for s in segments or []:
+        text = (s.get("text") or "").strip()
+        if not text:
+            continue
+        start = float(s.get("start") or 0.0)
+        end = float(s.get("end") or start + 30.0)
+        entries.append({"start": start, "end": end, "text": text, "ad": False})
+    if not entries:
+        return None
+
+    ads_report = ads_report or {}
+    served_report = served_report or {}
+
+    def _mark_overlapping(ws: float, we: float) -> None:
+        for e in entries:
+            if max(e["start"], ws) < min(e["end"], we):
+                e["ad"] = True
+
+    for s in ads_report.get("segments") or []:
+        _mark_overlapping(float(s.get("start") or 0.0), float(s.get("end") or 0.0))
+    for b in (ads_report.get("ad_breaks") or {}).get("breaks") or []:
+        start = float(b.get("start") or 0.0)
+        _mark_overlapping(start, start + 10.0)
+    for a in served_report.get("ads") or []:
+        pos = a.get("content_position")
+        if pos is None:
+            continue
+        _mark_overlapping(float(pos), float(pos) + float(a.get("duration") or 10.0) + 5.0)
+
+    for e in entries:
+        if not e["ad"] and _is_ad_like_text(e["text"]):
+            e["ad"] = True
+        del e["end"]
+    return entries
 
 
 def _ensure_work_dir() -> str:
@@ -383,7 +565,8 @@ def process_video(link: str | None = None, file_path: str | None = None,
                   model_name: str | None = None, language: str | None = None,
                   capture_served: bool | None = None,
                   served_watch_seconds: float | None = None,
-                  proof_dir: str | None = None) -> dict:
+                  proof_dir: str | None = None,
+                  job_id: str | None = None) -> dict:
     """Run the full pipeline and return a summary dict.
 
     Provide exactly one of ``link`` (remote URL) or ``file_path`` (local media).
@@ -394,6 +577,9 @@ def process_video(link: str | None = None, file_path: str | None = None,
     why it is off by default and takes ``served_watch_seconds``. For Twitch no
     browser is needed: its ads are stitched into the stream, so they are read
     from the stream's own playlist markers while the channel is live.
+
+    ``job_id`` (optional) keys the stage announcements the web UI polls while
+    the request runs; pipeline calls without one behave exactly as before.
     """
     if capture_served is None:
         capture_served = CAPTURE_SERVED_ADS
@@ -404,11 +590,14 @@ def process_video(link: str | None = None, file_path: str | None = None,
     if link:
         platform = "Twitch" if served_ads.detect_platform(link) == "twitch" else "YouTube"
         target = link
+        report_stage(job_id, "fetch",
+                     "downloading audio from " + (target or "the link"))
         video_path = download_youtube_audio(link)
         temp_files.append(video_path)
     elif file_path and os.path.exists(file_path):
         platform = "Uploaded File"
         target = file_path
+        report_stage(job_id, "fetch", "reading " + os.path.basename(file_path))
         video_path = file_path
     else:
         raise ValueError("Provide a YouTube link or upload a media file.")
@@ -417,12 +606,18 @@ def process_video(link: str | None = None, file_path: str | None = None,
     if audio_path != video_path:
         temp_files.append(audio_path)
 
+    report_stage(job_id, "transcribe",
+                 f"whisper {model_name or WHISPER_MODEL} on "
+                 f"{os.path.basename(audio_path)}")
     result = transcribe(audio_path, model_name=model_name, language=language)
     transcript = result["text"]
     sentiment, keywords = analyze_text(transcript)
 
     served_report: dict | None = None
     if capture_served and link:
+        report_stage(job_id, "ads",
+                     "watching for served ads on "
+                     + ("twitch.tv" if platform == "Twitch" else "youtube"))
         try:
             served_report = served_ads.capture_served_ads(
                 link,
@@ -437,6 +632,7 @@ def process_video(link: str | None = None, file_path: str | None = None,
                 "ad_seconds": 0.0, "note": f"Served-ad capture failed: {exc}",
             }
 
+    report_stage(job_id, "ads", "scanning transcript for sponsor reads")
     try:
         ad_report = ads.detect_ads(
             link=link,
@@ -450,6 +646,11 @@ def process_video(link: str | None = None, file_path: str | None = None,
             "ad_count": 0, "ad_seconds": 0, "segments": [],
             "verified": None, "note": f"Ad detection failed: {exc}",
         }
+
+    _enrich_served_ads(served_report)
+    timeline = _build_timeline(link, ad_report, served_report)
+    transcript_view = _build_transcript_view(result["segments"], ad_report,
+                                             served_report)
 
     save_to_excel(platform, target, transcript, sentiment, keywords,
                   ad_report=ad_report, served_report=served_report,
@@ -466,6 +667,8 @@ def process_video(link: str | None = None, file_path: str | None = None,
         "platform": platform,
         "target": target,
         "transcript": transcript,
+        "transcript_view": transcript_view,
+        "timeline": timeline,
         "sentiment": sentiment,
         "keywords": keywords,
         "report": report_path,
@@ -474,6 +677,7 @@ def process_video(link: str | None = None, file_path: str | None = None,
         "ads": ad_report,
         "served": served_report or ad_report.get("served") or {},
     }
+    report_stage(job_id, "done", "analysis complete")
     logger.info("Analysis complete: %s", os.path.basename(str(target)))
     return summary
 

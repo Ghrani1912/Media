@@ -199,13 +199,12 @@ proof/
 ## Tests
 
 ```
-mediaenv311/Scripts/python.exe -m pytest -q      # 161 passed, 3 xfailed
+mediaenv311/Scripts/python.exe -m pytest -q      # 165 passed
 ```
 
 Whisper, yt-dlp, Chrome, ffmpeg and the network are all faked, so the suite runs
 offline in seconds. The browser-driven capture is tested through a fake driver and
-a deterministic clock; the Twitch reader through scripted playlists. The three
-`xfail`s are the known UI gaps listed below.
+a deterministic clock; the Twitch reader through scripted playlists.
 
 ## Known limits, stated plainly
 
@@ -220,16 +219,15 @@ a deterministic clock; the Twitch reader through scripted playlists. The three
   ~2s segment boundaries.
 * Neither platform's ads can be *skipped* from here — the capture observes and
   proves, it does not modify playback.
-* The web UI renders a served ad field by field, so it does not yet show
-  everything a Twitch capture knows: the creative registry/gallery link, the
-  `title`-level summary line (labels, repeat sightings, evidence), the ad's own
-  `start`/`mid`/`end` frames, and positions of an hour or more (it formats them as
-  `mm:ss`). The three `xfail` tests in `tests/test_pipeline.py` name exactly these.
+* The web UI (the Broadcast Log report sheet) shows everything a capture
+  returns: the creative registry/gallery link, the ad's summary line (labels,
+  repeat sightings, evidence, decoded start/mid/end frames) and hour-aware
+  positions. Former UI gaps are now pinned by tests.
 
 ## Layout
 
 ```
-main.py         Flask front-end (/, /health)
+main.py         Flask front-end (/, /health, /proof/<file>, /downloads/<file>)
 process.py      the pipeline: download -> transcribe -> analyse -> Excel
 ads.py          in-video sponsor detection (SponsorBlock + transcript) + YouTube break schedule
 served_ads.py   YouTube served ads, read from a driven Chrome

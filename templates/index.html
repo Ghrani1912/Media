@@ -3,183 +3,461 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Media Analyzer</title>
+    <title>Media Analyzer — Broadcast Log</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:ital,wght@0,600;0,700;0,800;0,900;1,700&family=IBM+Plex+Mono:ital,wght@0,400;0,600;0,700;1,400&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;0,700;1,400&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
 </head>
 <body>
-    <main class="card">
-        <h2>Media Analyzer</h2>
-        <p class="subtitle">Transcribe and analyze the sentiment of a video or audio source.</p>
 
-        {% if error %}
-            <p class="alert error">{{ error }}</p>
-        {% endif %}
+<header class="header-band" role="banner">
+    <div class="brand-mark">
+        <span class="rec-dot" aria-hidden="true"></span>
+        <span>Media Analyzer</span>
+    </div>
+    <div class="header-telemetry" aria-label="System status telemetry">
+        <span>LOG: <strong>MEDIA-ANALYZER</strong></span>
+        <span>FREQ: <strong>16 KHZ / MONO</strong></span>
+        <span>STATUS: <strong class="{% if result %}telemetry-live{% else %}telemetry-standby{% endif %}">{% if result %}LOG COMPILED{% else %}STANDBY{% endif %}</strong></span>
+    </div>
+</header>
 
-        <form method="POST" enctype="multipart/form-data">
-            <label for="link">Paste a YouTube / Twitch link</label>
-            <input id="link" type="text" name="link" placeholder="https://...">
+<main class="app-viewport">
 
-            <div class="divider"><span>or</span></div>
+    {% if error %}
+        <div class="alert error" role="alert">{{ error }}</div>
+    {% endif %}
 
-            <label for="file">Upload a media file</label>
-            <input id="file" type="file" name="file"
-                   accept="video/*,audio/*,.mp4,.mov,.avi,.mkv,.webm,.m4a,.mp3,.wav">
+    {% if result %}
+    <!-- ================================================== -->
+    <!-- RESULTS VIEW (Broadcast Log Sheet)                  -->
+    <!-- ================================================== -->
+    <div class="collapsed-strip">
+        <div class="collapsed-source">
+            <span class="rec-dot" aria-hidden="true"></span>
+            <span>SOURCE: <strong>{{ result.platform }} // {{ result.title }}</strong></span>
+            <span>STATUS: <strong>LOG COMPILED</strong></span>
+        </div>
+        <a href="/" class="btn-new-analysis">NEW ANALYSIS</a>
+    </div>
 
-            <label for="model" class="model-label">Transcription accuracy</label>
-            <select id="model" name="model">
-                {% for m in models %}
-                    <option value="{{ m }}" {% if m == selected_model %}selected{% endif %}>
-                        {{ m }}{% if m == default_model %} (default){% elif m == 'medium' %} (more accurate, slower){% elif m == 'large' %} (most accurate, slowest){% endif %}
-                    </option>
-                {% endfor %}
-            </select>
+    <article class="report-sheet">
 
-            <label class="checkbox" for="capture_served">
-                <input id="capture_served" type="checkbox" name="capture_served" value="1">
-                <span class="checkbox-body">
-                    Capture the served ads
-                    <span class="hint">YouTube: opens a Chrome window, sweeps the whole
-                        video to catch pre-rolls and mid-rolls, and saves a proof clip of
-                        each ad plus frames from just before it appeared and just after
-                        it ended. Use SERVED_ADS_FULL=1 to play it all in real time
-                        instead of sweeping. Twitch: no browser needed, because the ads
-                        are stitched into the stream — it watches the live channel for
-                        a few minutes and reads the playlist's twitch-stitched-ad
-                        markers, then decodes each ad's own frames out of the segments
-                        it was stitched from.</span>
-                </span>
-            </label>
+        <!-- Report header -->
+        <header class="report-header">
+            <span class="report-source-tag">BROADCAST RECORD — {{ result.platform|upper }}</span>
+            <h2 class="report-media-title">{{ result.title }}</h2>
+            <div class="report-meta-line">
+                <div>MODEL: <span>{{ result.model }}</span></div>
+                <div>LANGUAGE: <span>{{ (result.language or '—')|upper }}</span></div>
+                <div>ANALYSIS: <span>WHISPER + TEXTBLOB</span></div>
+            </div>
+        </header>
 
-            <button type="submit">Analyze</button>
-        </form>
+        <!-- Sentiment & keywords row -->
+        <div class="evaluation-row">
 
-        {% if result %}
-            <section class="result">
-                <h3>Result</h3>
-                <dl>
-                    <dt>Source</dt>
-                    <dd>{{ result.platform }} — {{ result.target }}</dd>
-                    <dt>Model</dt>
-                    <dd>{{ result.model }}</dd>
-                    <dt>Sentiment</dt>
-                    <dd>{{ '%.3f'|format(result.sentiment) }}
-                        {% if result.sentiment > 0 %} (positive)
-                        {% elif result.sentiment < 0 %} (negative)
-                        {% else %} (neutral){% endif %}
-                    </dd>
-                    <dt>Keywords</dt>
-                    <dd>{{ result.keywords | join(', ') or '—' }}</dd>
-                    <dt>Ads</dt>
-                    <dd>
-                        {% if result.ads %}
-                            {{ result.ads.ad_count }} segment(s), {{ result.ads.ad_seconds }}s
-                        {% else %}
-                            —
-                        {% endif %}
-                    </dd>
-                </dl>
+            <div>
+                <h3 class="eval-block-title">01 / SENTIMENT EVALUATION</h3>
+                <div class="sentiment-meter-wrap">
+                    <div class="sentiment-track" role="img"
+                         aria-label="Sentiment polarity {{ '%+.2f'|format(result.sentiment) }} on a scale from -1.00 to +1.00">
+                        <div class="seg-neg" title="Negative range"></div>
+                        <div class="seg-neu" title="Neutral range"></div>
+                        <div class="seg-pos" title="Positive range"></div>
+                        <div class="score-marker" style="left: {{ ((result.sentiment + 1) * 50)|round(1) }}%;"
+                             title="Score position: {{ '%+.2f'|format(result.sentiment) }}"></div>
+                    </div>
+                    <div class="sentiment-readout">
+                        <span>RATING:
+                            <strong>{% if result.sentiment > 0 %}POSITIVE{% elif result.sentiment < 0 %}NEGATIVE{% else %}NEUTRAL{% endif %}</strong>
+                        </span>
+                        <span class="sentiment-score-badge">{{ '%+.2f'|format(result.sentiment) }}</span>
+                    </div>
+                </div>
+                <p class="control-description">Polarity runs &minus;1.00 to +1.00 across the full transcript; the yellow marker is this log's score.</p>
+            </div>
 
-                {% if result.ads %}
-                    <h4>In-video sponsors</h4>
-                    <p class="report-note">{{ result.ads.note }}</p>
-                    {% if result.ads.segments %}
-                        <ul class="ads">
-                            {% for s in result.ads.segments %}
-                                <li>
-                                    <span class="badge">{{ s.category }}</span>
-                                    {{ '%d:%02d'|format((s.start // 60)|int, (s.start % 60)|int) }}
-                                    &ndash;
-                                    {{ '%d:%02d'|format((s.end // 60)|int, (s.end % 60)|int) }}
-                                    <span class="src">{{ '%.1f'|format(s.duration) }}s &middot; {{ s.source }}</span>
-                                </li>
-                            {% endfor %}
-                        </ul>
-                    {% endif %}
-                {% endif %}
+            <div>
+                <h3 class="eval-block-title">INDEXED KEYWORDS</h3>
+                <div class="keyword-list">
+                    {% for k in result.keywords %}<span class="keyword-tag">{{ k }}</span>{% endfor %}
+                    {% if not result.keywords %}<span class="control-description">— none extracted</span>{% endif %}
+                </div>
+            </div>
 
-                {% if result.ads and result.ads.ad_breaks %}
-                    <h4>Ad break schedule <span class="hint">(the yellow progress-bar segments)</span></h4>
-                    <p class="report-note">{{ result.ads.ad_breaks.note }}</p>
-                    {% if result.ads.ad_breaks.breaks %}
-                        <ul class="ads">
-                            {% for b in result.ads.ad_breaks.breaks %}
-                                <li>
-                                    <span class="badge">{{ b.placement }}</span>
-                                    {% if b.start %}
-                                        scheduled at {{ '%d:%02d'|format((b.start // 60)|int, (b.start % 60)|int) }}
-                                    {% else %}
-                                        at the start of playback
-                                    {% endif %}
-                                </li>
-                            {% endfor %}
-                        </ul>
-                    {% endif %}
-                {% endif %}
+        </div>
 
+        {% if result.ads or result.served %}
+        <!-- Section 02: Ads -->
+        <section aria-labelledby="adsSectionHeading">
+            {% set event_count = (result.ads.ad_count or 0) + (result.served.ad_count or 0) %}
+            <div class="section-log-header">
+                <h3 id="adsSectionHeading" class="section-log-title">02 Ads &amp; Commercial Breaks</h3>
+                <span class="section-log-counter">[{{ '%02d'|format(event_count) }} EVENTS DETECTED]</span>
+            </div>
+
+            {% if result.ads %}<p class="report-note">{{ result.ads.note }}</p>{% endif %}
+
+            <div class="stat-numerals-row">
+                <div class="stat-num-card">
+                    <div class="numeral-value">{{ '%02d'|format(result.ads.ad_count or 0) }}</div>
+                    <div class="numeral-label">In-video commercial segments</div>
+                </div>
+                <div class="stat-num-card">
+                    <div class="numeral-value">{{ (result.ads.ad_seconds or 0)|round|int }}s</div>
+                    <div class="numeral-label">In-video ad seconds</div>
+                </div>
                 {% if result.served %}
-                    <h4>Served ads captured live
-                        <span class="hint">
-                            {%- if result.served.channel %}twitch.tv/{{ result.served.channel }}{% endif %}
-                            {{- result.served.source or '' }}
-                            &middot; {{ result.served.strategy }} watch</span></h4>
-                    <p class="report-note">{{ result.served.note }}</p>
-                    {% if result.served.ads %}
-                        <ul class="ads">
-                            {% for a in result.served.ads %}
-                                <li>
-                                    <span class="badge">{{ a.placement }}</span>
-                                    {% if a.format %}<span class="badge format">{{ a.format }}</span>{% endif %}
-                                    {% if a.ad_index and a.ad_pod_size %}<span class="badge format">ad {{ a.ad_index }} of {{ a.ad_pod_size }}</span>{% endif %}
-                                    <strong>{{ a.advertiser or ('Twitch house slate' if a.get('house_ad') else 'Unknown advertiser') }}</strong>
-                                    {% if a.destination %} &rarr; {{ a.destination }}{% endif %}
-                                    <span class="src">
-                                        {%- if a.duration %} {{ '%.0f'|format(a.duration) }}s{% endif %}
-                                        {%- if a.cta %} &middot; "{{ a.cta }}"{% endif %}
-                                        {%- if a.ad_index and a.ad_pod_size %} &middot; ad {{ a.ad_index }} of {{ a.ad_pod_size }}{% endif %}
-                                        {%- if a.skippable %} &middot; skippable{% if a.skip_after_s %} after {{ '%.0f'|format(a.skip_after_s) }}s{% endif %}{% endif %}
-                                    </span>
-                                    {% set pos = a.get('content_position', 0) or 0 %}
-                                    {% set total = a.get('content_duration') %}
-                                    <span class="hint ad-when">
-                                        video timeline
-                                        {{ '%d:%02d'|format((pos // 60)|int, (pos % 60)|int) }}
-                                        {%- if total %} of {{ '%d:%02d'|format((total // 60)|int, (total % 60)|int) }}{% endif %}
-                                        {%- if a.get('wall_started_at') %}
-                                            &middot; played at {{ a.wall_started_at }}
-                                            &middot; {{ '%.1f'|format(a.get('elapsed_s') or 0) }}s into the session
-                                        {%- endif %}
-                                        {%- if a.get('trigger') and a.trigger.startswith('seek') %} (triggered by {{ a.trigger }}){% endif %}
-                                        {%- if a.get('detection_latency_s') is not none %} &middot; first spotted {{ '%.1f'|format(a.detection_latency_s) }}s into the ad{% endif %}
-                                    </span>
-                                    {% if a.clip or a.thumbnail %}
-                                        <span class="hint ad-proof">
-                                            proof:
-                                            {%- if a.clip %} <code>{{ a.clip }}</code>{% endif %}
-                                            {%- if a.thumbnail %} <code>{{ a.thumbnail }}</code>{% endif %}
-                                        </span>
-                                    {% endif %}
-                                    {% if a.get('frame_before') or a.get('frame_after') %}
-                                        <span class="hint ad-proof">
-                                            boundary frames:
-                                            {%- if a.get('frame_before') %} before {{ '%.1f'|format(a.get('before_frame_s') or 0) }}s <code>{{ a.frame_before }}</code>{% endif %}
-                                            {%- if a.get('frame_after') %} &middot; after {{ '%.1f'|format(a.get('after_frame_s') or 0) }}s <code>{{ a.frame_after }}</code>{% endif %}
-                                        </span>
-                                    {% endif %}
-                                </li>
+                <div class="stat-num-card">
+                    <div class="numeral-value">{{ '%02d'|format(result.served.ad_count or 0) }}</div>
+                    <div class="numeral-label">Served / stitched ads</div>
+                </div>
+                {% endif %}
+            </div>
+
+            {% if result.timeline and (result.timeline.ticks or result.timeline.sponsors) %}
+            <div class="timeline-container">
+                <div class="timeline-title-row">
+                    <span>BROADCAST TIMELINE (0:00 — {{ result.timeline.total|hms }})</span>
+                    <div class="timeline-legend">
+                        <div class="legend-item"><span class="legend-box legend-yellow"></span> <span>SCHEDULED BREAK</span></div>
+                        <div class="legend-item"><span class="legend-box legend-red-outline"></span> <span>IN-VIDEO SPONSOR</span></div>
+                    </div>
+                </div>
+                <div class="track-bar">
+                    {% for t in result.timeline.ticks or [] %}
+                        <div class="ad-break-tick" style="left: {{ t.left }}%;"
+                             data-time="{{ t.label }}" title="Scheduled {{ t.placement }}: {{ t.label }}"></div>
+                    {% endfor %}
+                    {% for s in result.timeline.sponsors or [] %}
+                        <div class="sponsor-span" style="left: {{ s.left }}%; width: {{ s.width }}%;"
+                             data-sponsor="{{ s.label }}" title="{{ s.label }}"></div>
+                    {% endfor %}
+                </div>
+                <div class="timeline-axis">
+                    <span>0:00</span>
+                    <span>{{ (result.timeline.total / 2)|hms }}</span>
+                    <span>{{ result.timeline.total|hms }}</span>
+                </div>
+            </div>
+            {% endif %}
+
+            {% if result.ads and result.ads.ad_breaks %}
+            <div class="log-table-wrap">
+                <h4 class="eval-block-title">Scheduled ad breaks</h4>
+                {% if result.ads.ad_breaks.note %}<p class="report-note">{{ result.ads.ad_breaks.note }}</p>{% endif %}
+                {% if result.ads.ad_breaks.breaks %}
+                    <table class="log-table">
+                        <thead>
+                            <tr><th scope="col">PLACEMENT</th><th scope="col">SCHEDULED AT</th></tr>
+                        </thead>
+                        <tbody>
+                            {% for b in result.ads.ad_breaks.breaks %}
+                                <tr>
+                                    <td class="table-strong">{{ b.placement }}</td>
+                                    <td>{% if b.start %}{{ b.start|hms }}{% else %}start of playback{% endif %}</td>
+                                </tr>
                             {% endfor %}
-                        </ul>
-                    {% endif %}
-                    {% if result.served.manifest %}
-                        <p class="report-note">Capture manifest:
-                            <code>{{ result.served.manifest }}</code></p>
-                    {% endif %}
+                        </tbody>
+                    </table>
+                {% endif %}
+            </div>
+            {% endif %}
+
+            {% if result.ads and result.ads.segments %}
+            <div class="log-table-wrap">
+                <h4 class="eval-block-title">In-video sponsor reads</h4>
+                <table class="log-table">
+                    <thead>
+                        <tr>
+                            <th scope="col">SPONSOR CATEGORY</th>
+                            <th scope="col">START</th>
+                            <th scope="col">END</th>
+                            <th scope="col">DURATION</th>
+                            <th scope="col">SOURCE</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for s in result.ads.segments %}
+                            <tr>
+                                <td class="table-strong">{{ s.category }}</td>
+                                <td>{{ s.start|tc }}</td>
+                                <td>{{ s.end|tc }}</td>
+                                <td>{{ s.duration|tc }} ({{ s.duration|round|int }}s)</td>
+                                <td>{{ s.source }}</td>
+                            </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+            {% endif %}
+
+            {% if result.served %}
+            <div class="served-ads-wrap">
+                <h4 class="eval-block-title">SERVED PROGRAMMATIC BREAKS (LOGGED)</h4>
+                <div class="capture-meta">
+                    {%- if result.served.channel %}twitch.tv/{{ result.served.channel }} &middot; {% endif -%}
+                    {{ result.served.source or '' }}
+                    {%- if result.served.strategy %} &middot; {{ result.served.strategy }} watch{% endif -%}
+                    {%- if result.served.watched_seconds %} &middot; {{ result.served.watched_seconds|round|int }}s watched{% endif -%}
+                    {%- if result.served.polls %} &middot; {{ result.served.polls }} playlist polls{% endif %}
+                </div>
+                {% if result.served.note %}<p class="report-note">{{ result.served.note }}</p>{% endif %}
+                {% if result.served.creative_count %}
+                    <div class="capture-meta">
+                        creative registry: {{ result.served.creative_count }} known creative(s)
+                        {%- if result.served.creatives_index %} &middot;
+                            <a href="{{ result.served.creatives_index_url or result.served.creatives_index }}">{{ result.served.creatives_index }}</a>
+                        {%- endif %}
+                    </div>
                 {% endif %}
 
-                <h4>Transcript</h4>
-                <p class="transcript">{{ result.transcript or '(no speech detected)' }}</p>
-                <p class="report-note">Saved to <code>{{ report }}</code></p>
-            </section>
+                {% for a in result.served.ads %}
+                <div class="served-ad-row">
+                    <span class="ad-badge">AD {{ '%02d'|format(a.ordinal or a.ad_index or loop.index) }}</span>
+                    <div class="ad-info-main">
+                        <strong>{{ a.advertiser or ('Twitch house slate' if a.house_ad else 'Unknown advertiser') }}</strong>
+                        {% if a.destination %}<div class="ad-meta-text">&rarr; {{ a.destination }}</div>{% endif %}
+                        <div class="ad-meta-text">
+                            {{ a.placement }}{% if a.format %} &middot; {{ a.format }}{% endif %}
+                            {%- if a.ad_index and a.ad_pod_size %} &middot; ad {{ a.ad_index }} of {{ a.ad_pod_size }}{% endif -%}
+                            {%- if a.skippable %} &middot; skippable{% if a.skip_after_s %} after {{ a.skip_after_s|round|int }}s{% endif %}{% endif -%}
+                            {%- if a.roll_type %} &middot; {{ a.roll_type|lower }}{% endif %}
+                        </div>
+                        {% if a.cta %}<div class="ad-meta-text">&ldquo;{{ a.cta }}&rdquo;</div>{% endif %}
+                        {% if a.known_label %}<div class="ad-meta-text">identified as {{ a.known_label }}</div>{% endif %}
+                        {% if a.creative_id or a.creative_ref %}
+                            <div class="ad-meta-text">
+                                {%- if a.creative_id %}creative {{ a.creative_id }}{% endif -%}
+                                {%- if a.creative_ref %}{% if a.creative_id %} &middot; {% endif %}{{ a.creative_ref }}{% if a.times_seen %} &middot; seen {{ a.times_seen }} times{% endif %}{% endif %}
+                            </div>
+                        {% endif %}
+                        {% if a.evidence %}
+                            <div class="ad-meta-text">evidence: {{ a.evidence }}{% if a.frames_source %} via {{ a.frames_source }}{% endif %}</div>
+                        {% endif %}
+                        {% if a.summary %}<p class="ad-summary">{{ a.summary }}</p>{% endif %}
+                    </div>
+                    <div class="ad-metrics-cell">
+                        {% if a.content_position or a.content_position == 0 %}
+                            POSITION: {{ a.content_position|hms }}{% if a.content_duration %} of {{ a.content_duration|hms }}{% endif %}
+                        {% endif %}
+                        {% if a.duration %}<span>DURATION: {{ a.duration|round|int }}s</span>{% endif %}
+                        {% if a.wall_started_at %}
+                            <span>PLAYED AT: {{ a.wall_started_at }}{% if a.elapsed_s %} &middot; {{ a.elapsed_s|round(1) }}s into session{% endif %}</span>
+                        {% endif %}
+                        {% if a.detection_latency_s or a.detection_latency_s == 0 %}
+                            <span>DETECTED {{ a.detection_latency_s|round(1) }}s INTO THE AD</span>
+                        {% endif %}
+                    </div>
+                    <div class="ad-actions-cell">
+                        {% if a.thumb_url %}
+                            <a href="{{ a.thumb_url }}"><img class="thumb" src="{{ a.thumb_url }}" alt="decoded ad frame"></a>
+                        {% else %}
+                            <div class="hatched-thumb">{{ a.frame_start or a.thumbnail or 'NO FRAME CAPTURED' }}</div>
+                        {% endif %}
+                        <div class="proof-links">
+                            {% if a.clip %}<a href="{{ a.clip_url or a.clip }}">PROOF CLIP</a>{% endif %}
+                            {% for f in a.frame_urls or [] %}<a href="{{ f.url }}">{{ f.label }}</a>{% endfor %}
+                        </div>
+                        {% if a.frame_paths %}
+                            <div class="frame-code">{% for p in a.frame_paths %}<code>{{ p }}</code>{% endfor %}</div>
+                        {% endif %}
+                    </div>
+                </div>
+                {% endfor %}
+
+                {% if result.served.manifest or result.served.index %}
+                <div class="capture-links">
+                    {% if result.served.manifest %}manifest: <a href="{{ result.served.manifest_url or result.served.manifest }}">{{ result.served.manifest }}</a>{% endif %}
+                    {% if result.served.index %} &middot; proof index: <a href="{{ result.served.index_url or result.served.index }}">{{ result.served.index }}</a>{% endif %}
+                </div>
+                {% endif %}
+            </div>
+            {% endif %}
+        </section>
         {% endif %}
-    </main>
+
+        <!-- Section 03: Transcript -->
+        <section aria-labelledby="transcriptHeading">
+            <div class="section-log-header">
+                <h3 id="transcriptHeading" class="section-log-title">03 Synchronized Transcript</h3>
+                <span class="section-log-counter">[65CH LOG MEASURE]</span>
+            </div>
+            <div class="transcript-box" tabindex="0" role="region" aria-label="Scrollable audio transcript with timecodes">
+                {% if result.transcript_view %}
+                    {% for t in result.transcript_view %}
+                        <div class="transcript-entry">
+                            <span class="transcript-time">{{ t.start|tc }}</span>
+                            <div class="transcript-text">{% if t.ad %}<mark>{{ t.text }}</mark>{% else %}{{ t.text }}{% endif %}</div>
+                        </div>
+                    {% endfor %}
+                {% else %}
+                    <p class="transcript-plain">{{ result.transcript or '(no speech detected)' }}</p>
+                {% endif %}
+            </div>
+        </section>
+
+        <footer class="report-footer">
+            <div>REPORT SAVED TO: <span>{{ result.report }}</span></div>
+            <div>MEDIA ANALYZER &middot; WHISPER {{ result.model }}</div>
+        </footer>
+
+    </article>
+
+    {% else %}
+    <!-- ================================================== -->
+    <!-- INPUT VIEW (01 Source)                              -->
+    <!-- ================================================== -->
+    <section class="form-wrapper" aria-labelledby="inputSectionTitle">
+        <span class="section-badge">01 SOURCE SPECIFICATION</span>
+
+        <div class="broadcast-title-block">
+            <h1 id="inputSectionTitle" class="headline-main">Media Analyzer</h1>
+            <p class="headline-sub">Transcribe and analyze sentiment for any video or audio source. Track in-video sponsors, scheduled breaks, and dynamically served ads.</p>
+        </div>
+
+        <form id="analyzerForm" method="POST" enctype="multipart/form-data">
+
+            <div class="field-group">
+                <label for="link" class="field-label">Media Source Link [YouTube / Twitch]</label>
+                <input type="text" id="link" name="link" class="input-box"
+                       placeholder="Paste a YouTube or Twitch link" aria-describedby="mediaLinkHint">
+                <div id="mediaLinkHint" class="control-description">Accepts live broadcasts, VODs, premiere streams, and direct media manifests.</div>
+            </div>
+
+            <div class="or-divider" aria-hidden="true"><span>OR</span></div>
+
+            <div class="drop-zone" id="dropArea" tabindex="0" role="button"
+                 aria-label="Drop a file here, or browse local video or audio"
+                 onkeydown="if(event.key==='Enter'||event.key===' ') document.getElementById('file').click();">
+                <input type="file" id="file" name="file" style="display:none;"
+                       accept="video/*,audio/*,.mp4,.mov,.avi,.mkv,.webm,.m4a,.mp3,.wav"
+                       onchange="handleFileSelected(this)">
+                <div class="drop-primary-text" id="dropLabel">Drop a file here, or browse</div>
+                <div class="drop-secondary-text">SUPPORTED: MP4, MOV, AVI, MKV, WEBM, M4A, MP3, WAV (UP TO {{ max_upload_mb }} MB)</div>
+            </div>
+
+            <div class="controls-grid">
+
+                <div>
+                    <span class="field-label">Transcription Accuracy</span>
+                    <div class="segmented-control" role="radiogroup" aria-label="Transcription accuracy level">
+                        {% for m in models %}
+                            <input class="segment-input" type="radio" id="model-{{ m }}" name="model" value="{{ m }}"{% if m == selected_model %} checked{% endif %}>
+                            <label class="segment-btn" for="model-{{ m }}"
+                                   data-desc="{{ model_notes.get(m, '') }}{% if m == default_model %} (default){% endif %}">{{ m }}</label>
+                        {% endfor %}
+                    </div>
+                    <div id="accuracyDescription" class="control-description">{{ model_notes.get(selected_model, '') }}{% if selected_model == default_model %} (default){% endif %}</div>
+                </div>
+
+                <div>
+                    <span class="field-label">Ad Intelligence</span>
+                    <div class="toggle-container">
+                        <input type="checkbox" name="capture_served" id="capture_served" value="1" class="switch-input">
+                        <label class="switch-button" for="capture_served" aria-hidden="true"><span class="switch-knob"></span></label>
+                        <div class="toggle-label-wrap">
+                            <div class="toggle-label-row">
+                                <label for="capture_served" class="toggle-label">Capture Served Ads</label>
+                                <span class="info-btn" tabindex="0" role="note" aria-label="Information on the ad capture protocol">?
+                                    <span class="tooltip-box">
+                                        YouTube: opens a real Chrome window and sweeps the video to catch the pre-rolls and mid-rolls
+                                        actually played, saving a proof clip of each ad plus boundary frames. Twitch: no browser needed —
+                                        ads are stitched into the stream, so it watches the live channel for a few minutes and reads the
+                                        playlist's twitch-stitched-ad markers, then decodes each ad's own frames from the segments.
+                                    </span>
+                                </span>
+                            </div>
+                            <span class="control-description">Real-time programmatic sweep</span>
+                        </div>
+                    </div>
+                </div>
+
+            </div>
+
+            <button type="submit" id="analyzeBtn" class="btn-analyze" aria-label="Execute media and ad analysis">
+                <span id="btnText">ANALYZE MEDIA &amp; ADS</span>
+            </button>
+            <p class="control-description" style="text-align:center;">Full sweep + transcription can take minutes — keep this tab open.</p>
+
+        </form>
+    </section>
+    {% endif %}
+
+</main>
+
+<script>
+    // File drop zone
+    const dropArea = document.getElementById('dropArea');
+    const dropLabel = document.getElementById('dropLabel');
+    const fileInput = document.getElementById('file');
+
+    function showFileName(files) {
+        if (files.length > 0 && dropLabel) {
+            dropLabel.textContent = 'FILE ATTACHED: ' + files[0].name.toUpperCase();
+        }
+    }
+
+    if (dropArea) {
+        ['dragenter', 'dragover'].forEach(function (name) {
+            dropArea.addEventListener(name, function (e) {
+                e.preventDefault();
+                e.stopPropagation();
+                dropArea.classList.add('dragover');
+            }, false);
+        });
+        ['dragleave', 'drop'].forEach(function (name) {
+            dropArea.addEventListener(name, function (e) {
+                e.preventDefault();
+                e.stopPropagation();
+                dropArea.classList.remove('dragover');
+            }, false);
+        });
+        dropArea.addEventListener('drop', function (e) { showFileName(e.dataTransfer.files); });
+        dropArea.addEventListener('click', function () { fileInput.click(); });
+    }
+
+    function handleFileSelected(input) { showFileName(input.files); }
+
+    // Accuracy segmented control: mirror the picked model into the description line
+    const accuracyDescription = document.getElementById('accuracyDescription');
+    document.querySelectorAll('input[name="model"]').forEach(function (r) {
+        r.addEventListener('change', function () {
+            if (r.checked && accuracyDescription) {
+                accuracyDescription.textContent = r.getAttribute('data-desc');
+            }
+        });
+    });
+
+    // Mechanical stepped loading while the real POST runs
+    const analyzerForm = document.getElementById('analyzerForm');
+    if (analyzerForm) {
+        analyzerForm.addEventListener('submit', function () {
+            const btn = document.getElementById('analyzeBtn');
+            if (!btn || btn.classList.contains('loading-mode')) { return; }
+            btn.classList.add('loading-mode');
+            btn.innerHTML =
+                '<span class="loading-status-text"><span class="rec-dot"></span>' +
+                '<span id="stepLabel">01/03 FETCHING AUDIO</span></span>' +
+                '<div class="loading-stepped-bar"><div id="stepFill" class="loading-step-fill"></div></div>';
+            const stepLabel = document.getElementById('stepLabel');
+            const stepFill = document.getElementById('stepFill');
+            setTimeout(function () {
+                if (stepLabel && stepFill) {
+                    stepLabel.textContent = '02/03 TRANSCRIBING';
+                    stepFill.style.width = '66.6%';
+                }
+            }, 2500);
+            setTimeout(function () {
+                if (stepLabel && stepFill) {
+                    stepLabel.textContent = '03/03 READING ADS';
+                    stepFill.style.width = '100%';
+                }
+            }, 6000);
+        });
+    }
+</script>
 </body>
 </html>
