@@ -1,12 +1,18 @@
-# Virtual environment
+# Virtual environments
 mediaenv311/
 venv/
+venv*/
 .venv/
+.venv*/
 
 # Python
 __pycache__/
 *.pyc
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 *.log
 *.tmp
 *.db
@@ -20,5 +26,8 @@ audio.wav
 media_report.xlsx
 uploads/
 
-# Served-ad proof clips, thumbnails and manifests
+# Served-ad proof clips, thumbnails and manifests. Twitch's creative registry
+# (twitch_ad_creatives.json) and its gallery (creatives.html) live in here too:
+# they record what Twitch served to this machine over time, which is local
+# observation rather than source.
 proof/

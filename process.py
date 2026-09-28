@@ -46,10 +46,28 @@ REPORT_HEADERS = [
 ]
 
 # Served-ad capture drives a real browser, so it is opt-in. Enable it with
-# CAPTURE_SERVED_ADS=1 (or the UI checkbox when analyzing a YouTube link).
+# CAPTURE_SERVED_ADS=1 (or the UI checkbox when analyzing a link).
 CAPTURE_SERVED_ADS = os.environ.get("CAPTURE_SERVED_ADS", "").strip().lower() in {
     "1", "true", "yes"
 }
+# Optional fixed-length capture window. On YouTube this replaces the sweep with a
+# plain watch of that many seconds; on Twitch it caps how long the live channel is
+# watched for a break. Unset, each platform uses its own default (a full sweep for
+# YouTube, SERVED_ADS_TWITCH_WATCH for Twitch).
+SERVED_ADS_SECONDS = os.environ.get("SERVED_ADS_SECONDS")
+
+
+def _served_window() -> float | None:
+    """``SERVED_ADS_SECONDS`` as a number, or None when unset/unusable."""
+    if not SERVED_ADS_SECONDS:
+        return None
+    try:
+        seconds = float(SERVED_ADS_SECONDS)
+    except ValueError:
+        logger.warning("SERVED_ADS_SECONDS=%r is not a number; ignoring it",
+                       SERVED_ADS_SECONDS)
+        return None
+    return seconds if seconds > 0 else None
 
 # Audio extensions that need no ffmpeg conversion.
 _READY_AUDIO_EXT = {".mp3", ".wav", ".m4a", ".flac", ".ogg"}
@@ -370,17 +388,21 @@ def process_video(link: str | None = None, file_path: str | None = None,
 
     Provide exactly one of ``link`` (remote URL) or ``file_path`` (local media).
 
-    ``capture_served`` enables the live served-ad capture for YouTube links: a
-    real Chrome is driven to watch the video and record the ads YouTube actually
-    plays (the pre-roll/mid-roll spots behind the yellow progress bar). It is off
-    by default because it opens a browser and takes ``served_watch_seconds``.
+    ``capture_served`` enables the served-ad capture for links. For YouTube that
+    means driving a real Chrome to watch the video and record the ads actually
+    played (the pre-roll/mid-roll spots behind the yellow progress bar), which is
+    why it is off by default and takes ``served_watch_seconds``. For Twitch no
+    browser is needed: its ads are stitched into the stream, so they are read
+    from the stream's own playlist markers while the channel is live.
     """
     if capture_served is None:
         capture_served = CAPTURE_SERVED_ADS
+    if served_watch_seconds is None:
+        served_watch_seconds = _served_window()
     temp_files: list[str] = []
 
     if link:
-        platform = "YouTube"
+        platform = "Twitch" if served_ads.detect_platform(link) == "twitch" else "YouTube"
         target = link
         video_path = download_youtube_audio(link)
         temp_files.append(video_path)

@@ -2,15 +2,17 @@
 
 Two layers, because there are genuinely two kinds of "ad":
 
-1. **Served ads** (YouTube pre-roll/mid-roll) are stitched in by the player and
-   are *never* part of the downloaded stream, so they cannot be recovered from
-   the media file. Nothing here can invent them.
+1. **Served ads** are chosen at play time and are not part of what gets
+   downloaded, so they cannot be recovered from the media file. Nothing here can
+   invent them.
 
    Two extra layers cover served ads from this side: ``fetch_ad_breaks`` reads
    YouTube's published ad-break *schedule* (the yellow progress-bar layout), and
-   ``detect_ads`` accepts a live capture from ``served_ads.py`` that records the
-   ads actually played in a browser session. This module never invents ads it
-   cannot see.
+   ``detect_ads`` accepts a capture from whichever platform reader applies --
+   ``served_ads.py`` for YouTube (a browser session, where the ad is an overlay)
+   or ``twitch_ads.py`` for Twitch (the stream's own stitched-ad markers, since
+   Twitch sews the ad into the media). This module never invents ads it cannot
+   see.
 
 2. **In-video sponsor/ad breaks** (a creator reading a sponsor script, a paid
    segment) *are* in the stream and can be detected. This module finds them two

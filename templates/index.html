@@ -37,12 +37,16 @@
             <label class="checkbox" for="capture_served">
                 <input id="capture_served" type="checkbox" name="capture_served" value="1">
                 <span class="checkbox-body">
-                    Capture the ads YouTube actually plays
-                    <span class="hint">Opens a Chrome window, sweeps the whole video to
-                        catch pre-rolls and mid-rolls, and saves a proof clip of each ad
-                        plus frames from just before it appeared and just after it ended.
-                        YouTube links only. Use SERVED_ADS_FULL=1 to play it all in
-                        real time instead of sweeping.</span>
+                    Capture the served ads
+                    <span class="hint">YouTube: opens a Chrome window, sweeps the whole
+                        video to catch pre-rolls and mid-rolls, and saves a proof clip of
+                        each ad plus frames from just before it appeared and just after
+                        it ended. Use SERVED_ADS_FULL=1 to play it all in real time
+                        instead of sweeping. Twitch: no browser needed, because the ads
+                        are stitched into the stream — it watches the live channel for
+                        a few minutes and reads the playlist's twitch-stitched-ad
+                        markers, then decodes each ad's own frames out of the segments
+                        it was stitched from.</span>
                 </span>
             </label>
 
@@ -114,7 +118,10 @@
 
                 {% if result.served %}
                     <h4>Served ads captured live
-                        <span class="hint">{{ result.served.strategy }} watch</span></h4>
+                        <span class="hint">
+                            {%- if result.served.channel %}twitch.tv/{{ result.served.channel }}{% endif %}
+                            {{- result.served.source or '' }}
+                            &middot; {{ result.served.strategy }} watch</span></h4>
                     <p class="report-note">{{ result.served.note }}</p>
                     {% if result.served.ads %}
                         <ul class="ads">
@@ -123,7 +130,7 @@
                                     <span class="badge">{{ a.placement }}</span>
                                     {% if a.format %}<span class="badge format">{{ a.format }}</span>{% endif %}
                                     {% if a.ad_index and a.ad_pod_size %}<span class="badge format">ad {{ a.ad_index }} of {{ a.ad_pod_size }}</span>{% endif %}
-                                    <strong>{{ a.advertiser or 'Unknown advertiser' }}</strong>
+                                    <strong>{{ a.advertiser or ('Twitch house slate' if a.get('house_ad') else 'Unknown advertiser') }}</strong>
                                     {% if a.destination %} &rarr; {{ a.destination }}{% endif %}
                                     <span class="src">
                                         {%- if a.duration %} {{ '%.0f'|format(a.duration) }}s{% endif %}

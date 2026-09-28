@@ -14,6 +14,13 @@ The only reliable way to see served ads is to watch the video the way a person
 does: open it in a browser and read the player's ad overlay. That is what this
 module does, using Selenium to drive a local Chrome.
 
+Twitch is different again: it *stitches* ads into the HLS stream instead of
+overlaying them, so there is no player state to read and the browser trick has
+nothing to watch. Twitch links are therefore handed to ``twitch_ads``, which
+reads the stream's own ``twitch-stitched-ad`` markers; ``detect_platform`` picks
+the right reader and ``capture_served_ads`` stays the single entry point for
+either platform.
+
 Covering the whole video
 ------------------------
 Watching a 30-minute video in real time is slow, so the default strategy is a
@@ -47,6 +54,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+import urllib.parse
 import uuid
 from datetime import datetime
 
@@ -173,6 +181,28 @@ _EXTRACT_JS = r"""
     player_rect: rect
   });
 """
+
+# The rolling gallery of Twitch creatives, written by ``twitch_ads``; the proof
+# index links to it whenever it sits beside the frames.
+CREATIVES_PAGE = "creatives.html"
+
+_YOUTUBE_HOSTS = ("youtube.com", "youtube-nocookie.com")
+
+
+def detect_platform(url: str) -> str:
+    """Which served-ad reader a link needs: ``youtube``, ``twitch`` or ``unknown``."""
+    try:
+        host = (urllib.parse.urlsplit(url or "").hostname or "").lower()
+    except ValueError:
+        return "unknown"
+    if host == "youtu.be" or any(
+        host == name or host.endswith("." + name) for name in _YOUTUBE_HOSTS
+    ):
+        return "youtube"
+    if host == "twitch.tv" or host.endswith(".twitch.tv"):
+        return "twitch"
+    return "unknown"
+
 
 _DISMISS_SELECTORS = (
     "button[aria-label*='Accept all']",
@@ -1011,7 +1041,11 @@ def capture_served_ads(url: str, watch_seconds: float | None = None,
                        full_watch: bool | None = None,
                        max_seconds: float | None = None,
                        video_id: str | None = None) -> dict:
-    """Watch ``url`` in Chrome and record the ads YouTube actually plays.
+    """Watch ``url`` and record the ads the platform actually served.
+
+    YouTube links are watched in Chrome (the strategies below). Twitch links are
+    handed to ``twitch_ads``, which reads the stream's own ad markers instead, and
+    the report that comes back has the same shape either way.
 
     Watching strategies:
 
@@ -1023,6 +1057,23 @@ def capture_served_ads(url: str, watch_seconds: float | None = None,
     one ad was observed, so "watched but got no ads" stays distinct from "could
     not watch at all".
     """
+    if detect_platform(url) == "twitch":
+        # Twitch ads are stitched into the stream, so they are read from the
+        # stream's own playlist markers rather than from a browser. Imported
+        # here because ``twitch_ads`` reuses this module's proof-report writers.
+        import twitch_ads
+
+        return twitch_ads.capture_twitch_ads(
+            url,
+            watch_seconds=watch_seconds,
+            headless=headless,
+            proof_dir=proof_dir,
+            record=record,
+            full_watch=full_watch,
+            max_seconds=max_seconds,
+            video_id=video_id,
+        )
+
     result = {
         "available": False,
         "captured": False,
@@ -1166,8 +1217,22 @@ def _write_manifest(recorder, url, video_id, ads, result, strategy) -> str | Non
 _LABELS = ("before", "start", "mid", "end", "after")
 
 
+_TWITCH_FRAME_CAPTIONS = {
+    "before": "content segment just before the ad",
+    "start": "the ad's own first frame",
+    "mid": "the ad's own middle frame",
+    "end": "the ad's own last frame",
+    "after": "content segment just after the ad",
+}
+
+
 def _label_caption(label: str, ad: dict) -> str:
     """Caption a boundary frame with how far it sits from the ad's edges."""
+    if ad.get("frames_source") == "stream-segments":
+        # Twitch frames are decoded out of the segments the ad itself was
+        # stitched from, so they mark a point *in* the ad rather than a delay in
+        # noticing it.
+        return _TWITCH_FRAME_CAPTIONS.get(label, label)
     if label == "before":
         delta = ad.get("before_frame_s")
         return "content just before" if delta is None else f"content {delta}s before"
@@ -1232,7 +1297,14 @@ def _write_index(recorder, url: str, ads) -> str | None:
         ".strip figcaption{color:#9aa3b2;font-size:12px;margin-top:4px}"
         ".strip b{color:#e8eaf0}</style>"
         f"<h1>Served ads for {recorder.video_id}</h1>"
-        f"<p class='meta'>Source: {url}</p><ul>" + "".join(rows) + "</ul>"
+        f"<p class='meta'>Source: {url}</p>"
+        + (
+            f"<p class='meta'><a href='{CREATIVES_PAGE}'>Every Twitch creative seen "
+            "so far &rarr;</a></p>"
+            if os.path.exists(os.path.join(recorder.proof_dir, CREATIVES_PAGE))
+            else ""
+        )
+        + "<ul>" + "".join(rows) + "</ul>"
     )
     path = os.path.join(recorder.proof_dir, "index.html")
     try:
@@ -1245,11 +1317,18 @@ def _write_index(recorder, url: str, ads) -> str | None:
 
 
 def format_timeline(ad: dict) -> str:
-    """Human-readable position of an ad on the video timeline and wall clock."""
+    """Human-readable position of an ad on the video timeline and wall clock.
+
+    Hours appear only when there are any, which keeps short videos reading as
+    ``5:12`` while still describing a long Twitch broadcast honestly.
+    """
     position = ad.get("content_position")
     if position is None:
         return ""
-    minutes, seconds = divmod(int(position), 60)
+    hours, rest = divmod(int(position), 3600)
+    minutes, seconds = divmod(rest, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{seconds:02d}"
     return f"{minutes}:{seconds:02d}"
 
 

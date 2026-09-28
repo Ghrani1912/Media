@@ -26,6 +26,16 @@
 # selenium, so Google Chrome (or Edge) must be installed. Selenium downloads a
 # matching driver on first use. Install with: pip install selenium
 #
+# Twitch ads need no browser: they are stitched into the stream (SSAI), so they
+# are read from the live playlist's twitch-stitched-ad markers and each ad's
+# frames are decoded from the segments it was stitched from.
+#   SERVED_ADS_TWITCH_WATCH=300        seconds to watch a live channel for a break
+#   SERVED_ADS_TWITCH_POLL=2           seconds between playlist reads
+#   SERVED_ADS_TWITCH_FRAMES=5         proof frames per ad (0 disables them)
+#   SERVED_ADS_TWITCH_HEIGHT=360       rendition height those frames come from
+#   TWITCH_CLIENT_ID=...               override the public web client id used to
+#                                      open the playback session
+#
 # openai-whisper pulls in numba, which requires NumPy <= 2.2; pin NumPy
 # accordingly or Whisper will fail to import.
 flask>=3.0

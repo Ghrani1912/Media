@@ -465,3 +465,192 @@ def test_uploaded_file_is_deleted(tmp_path, monkeypatch, client):
         content_type="multipart/form-data",
     )
     assert os.listdir(str(tmp_path)) == []
+
+
+# --------------------------------------------------------------------------- #
+# Twitch routing, the fixed-window env var, and what the UI makes of a capture
+# --------------------------------------------------------------------------- #
+def _twitch_served_report(**overrides):
+    """A served-ad report shaped like the real Twitch reader's output."""
+    report = {
+        "available": True,
+        "captured": True,
+        "ad_count": 1,
+        "ad_seconds": 30.2,
+        "watched_seconds": 47.0,
+        "strategy": "live",
+        "source": "stream-markers",
+        "channel": "gon_vl",
+        "polls": 22,
+        "content_duration": 3725.0,
+        "manifest": "proof/gon_vl_manifest.json",
+        "index": "proof/index.html",
+        "creatives_index": "proof/creatives.html",
+        "creative_count": 1,
+        "note": ("Captured 1 served ad(s) from the stream's own ad markers over 47s "
+                 "of twitch.tv/gon_vl. 1 of them filled by Twitch's own house slate."),
+        "ads": [{
+            "platform": "twitch", "ordinal": 1, "ad_id": "stitched-ad-1",
+            "placement": "pre-roll", "format": "ssai stitched in-stream",
+            "roll_type": "PREROLL", "ad_format": "standard_video_ad",
+            "house_ad": True, "advertiser": None, "destination": "https://www.twitch.tv",
+            "creative_id": "2474283100494", "ad_index": 1, "ad_pod_size": 1,
+            "duration": 30.2, "content_position": 3606.0, "content_duration": 3725.0,
+            "wall_started_at": "2026-09-28T16:21:03", "elapsed_s": 2.0,
+            "detection_latency_s": 4.0, "evidence": "stream-frames",
+            "frames_source": "stream-segments", "trigger": "playlist-marker",
+            "creative_ref": "creative-0001", "times_seen": 2,
+            "known_label": None, "frame_start": "proof/gon_vl_ad01_1_start.png",
+            "frame_after": "proof/gon_vl_ad01_4_after.png", "after_frame_s": 1.0,
+            "summary": ("house/filler slate (Twitch's own break card, no advertiser) "
+                        "30s preroll creative 2474283100494 ad 1 of 1 repeat sighting "
+                        "(creative-0001, 2 times)"),
+        }],
+    }
+    report.update(overrides)
+    return report
+
+
+def test_twitch_links_are_labelled_twitch_and_capture_through_one_call(
+        monkeypatch, fake_model, tmp_path):
+    downloaded = tmp_path / "tw.mp3"
+    downloaded.write_bytes(b"x")
+    monkeypatch.setattr(process, "download_youtube_audio", lambda url: str(downloaded))
+    monkeypatch.setattr(process.ads, "fetch_sponsor_segments",
+                        lambda vid, timeout=15.0: [])
+    monkeypatch.setattr(process.ads, "fetch_ad_breaks",
+                        lambda vid, timeout=20.0: None)
+    seen: dict = {}
+    monkeypatch.setattr(
+        process.served_ads, "capture_served_ads",
+        lambda url, **kwargs: seen.update({"url": url}, **kwargs)
+        or _twitch_served_report(),
+    )
+
+    summary = process.process_video(
+        link="https://www.twitch.tv/gon_vl", capture_served=True,
+        report_path=str(tmp_path / "r.xlsx"),
+    )
+    assert summary["platform"] == "Twitch"
+    assert seen["url"] == "https://www.twitch.tv/gon_vl"
+    assert summary["served"]["ad_count"] == 1
+    assert summary["ads"]["served_ad_count"] == 1
+
+    from openpyxl import load_workbook
+
+    sheet = load_workbook(str(tmp_path / "r.xlsx")).active
+    assert sheet.cell(2, 1).value == "Twitch"
+    assert sheet.cell(2, 9).value == 1
+    assert "house/filler slate" in sheet.cell(2, 10).value
+    assert "1:00:06" in sheet.cell(2, 10).value
+
+
+@pytest.mark.parametrize("value,expected", [
+    ("45", 45.0), ("12.5", 12.5), (None, None), ("", None), ("0", None),
+    ("-3", None), ("soon", None),
+])
+def test_served_window_env_parsing(monkeypatch, value, expected):
+    monkeypatch.setattr(process, "SERVED_ADS_SECONDS", value)
+    assert process._served_window() == expected
+
+
+def test_served_window_env_reaches_the_capture(monkeypatch, fake_model, tmp_path):
+    downloaded = tmp_path / "yt.mp3"
+    downloaded.write_bytes(b"x")
+    monkeypatch.setattr(process, "download_youtube_audio", lambda url: str(downloaded))
+    monkeypatch.setattr(process.ads, "fetch_sponsor_segments",
+                        lambda vid, timeout=15.0: [])
+    monkeypatch.setattr(process.ads, "fetch_ad_breaks",
+                        lambda vid, timeout=20.0: None)
+    monkeypatch.setattr(process, "SERVED_ADS_SECONDS", "45")
+    seen: dict = {}
+    monkeypatch.setattr(process.served_ads, "capture_served_ads",
+                        lambda url, **kwargs: seen.update(kwargs)
+                        or _twitch_served_report())
+
+    process.process_video(link="https://youtu.be/x", capture_served=True,
+                          keep_temp=True, report_path=str(tmp_path / "r.xlsx"))
+    assert seen["watch_seconds"] == 45.0
+
+    # an explicit argument still wins over the environment
+    process.process_video(link="https://youtu.be/x", capture_served=True,
+                          keep_temp=True, served_watch_seconds=10.0,
+                          report_path=str(tmp_path / "r.xlsx"))
+    assert seen["watch_seconds"] == 10.0
+
+
+def test_post_renders_a_twitch_capture(monkeypatch, client):
+    import main
+
+    monkeypatch.setattr(
+        main, "process_video",
+        lambda **kwargs: {
+            "platform": "Twitch", "target": "https://www.twitch.tv/gon_vl",
+            "transcript": "hi", "sentiment": 0.0, "keywords": [],
+            "report": "r.xlsx", "model": kwargs.get("model_name") or "small",
+            "ads": {"ad_count": 0, "ad_seconds": 0, "segments": [],
+                    "note": "No ad segments detected."},
+            "served": _twitch_served_report(),
+        },
+    )
+    body = client.post(
+        "/", data={"link": "https://www.twitch.tv/gon_vl", "capture_served": "1"},
+    ).data.decode()
+
+    assert "Twitch" in body
+    assert "twitch.tv/gon_vl" in body          # which channel was watched
+    assert "stream-markers" in body             # where the ad reading came from
+    assert "live watch" in body
+    assert "Twitch house slate" in body         # named, not "Unknown advertiser"
+    assert "ssai stitched in-stream" in body    # the ad format
+    assert "ad 1 of 1" in body
+    assert "proof/gon_vl_manifest.json" in body
+
+
+# The web UI renders a served ad field by field, so anything the capture starts
+# reporting has to be added there too. These three record what a Twitch capture
+# knows but the UI does not put on the page yet; they start passing as soon as it
+# does (pytest reports XPASS, not a failure).
+def _post_twitch(monkeypatch, client, report=None):
+    import main
+
+    served = report or _twitch_served_report()
+    monkeypatch.setattr(
+        main, "process_video",
+        lambda **kwargs: {
+            "platform": "Twitch", "target": "https://www.twitch.tv/gon_vl",
+            "transcript": "hi", "sentiment": 0.0, "keywords": [],
+            "report": "r.xlsx", "model": "small",
+            "ads": {"ad_count": 0, "ad_seconds": 0, "segments": [], "note": "",
+                    "ad_breaks": None},
+            "served": served,
+        },
+    )
+    return client.post("/", data={"link": "https://www.twitch.tv/gon_vl"}).data.decode()
+
+
+@pytest.mark.xfail(reason="the UI does not surface the creative registry/gallery yet")
+def test_post_links_to_the_twitch_creative_gallery(monkeypatch, client):
+    body = _post_twitch(monkeypatch, client)
+    assert "proof/creatives.html" in body
+    assert "creative-0001" in body
+    assert "2 times" in body
+
+
+@pytest.mark.xfail(reason="the UI lists fields, never the ad's own summary line")
+def test_post_shows_a_labelled_twitch_creative(monkeypatch, client):
+    report = _twitch_served_report()
+    report["ads"][0]["known_label"] = "Amazon deals"
+    report["ads"][0]["advertiser"] = "amazon.in"
+    report["ads"][0]["house_ad"] = False
+    report["ads"][0]["summary"] = "identified as Amazon deals via amazon.in 30s"
+    body = _post_twitch(monkeypatch, client, report)
+    assert "amazon.in" in body  # the parts that are shown today
+    assert "Amazon deals" in body
+
+
+@pytest.mark.xfail(reason="the UI shows boundary frames only, not the decoded ad frames")
+def test_post_shows_the_decoded_ad_frames(monkeypatch, client):
+    body = _post_twitch(monkeypatch, client)
+    assert "proof/gon_vl_ad01_1_start.png" in body
+    assert "stream-frames" in body  # how much evidence there is, and from where
