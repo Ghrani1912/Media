@@ -68,6 +68,13 @@ AD_WAIT_SECONDS = float(os.environ.get("SERVED_ADS_AD_WAIT", "120"))
 # often begins in these first seconds, so they are the only chance to catch what
 # it interrupted.
 WARMUP_SECONDS = float(os.environ.get("SERVED_ADS_WARMUP", "8"))
+# A pod's next spot restarts the ad's own playhead. A drop of more than this many
+# seconds, back to within the tolerance of zero, means "new ad" even when the
+# advertiser card is identical.
+POD_RESTART_SECONDS = float(os.environ.get("SERVED_ADS_POD_RESTART", "5"))
+POD_RESTART_TOLERANCE = float(os.environ.get("SERVED_ADS_POD_RESTART_TOLERANCE", "3"))
+# An ad this short or shorter is a bumper rather than an in-stream spot.
+BUMPER_SECONDS = float(os.environ.get("SERVED_ADS_BUMPER_SECONDS", "7"))
 # How far to jump between seek stops.
 SEEK_STEP_SECONDS = float(os.environ.get("SERVED_ADS_SEEK_STEP", "120"))
 # Safety ceiling for a single capture.
@@ -121,8 +128,13 @@ _EXTRACT_JS = r"""
     if (video) { ended = video.ended; paused = video.paused; }
   } catch (e) {}
 
-  const adsText = t('.video-ads') || '';
-  const pod = adsText.match(/(\d+)\s*of\s*(\d+)/);
+  // "1 of 2" can be rendered in either the ad slot or the overlay layout.
+  const podText = (t('.video-ads') || '') + ' ' + (t('.ytp-ad-player-overlay-layout') || '');
+  const pod = podText.match(/(\d+)\s*of\s*(\d+)/);
+
+  // The badge YouTube stamps on the ad ("Ad", "Sponsored"). Best effort: not
+  // every player layout renders one.
+  const badge = t('.ytp-ad-simple-ad-badge') || t('.ytp-ad-badge__text') || t('.ytp-ad-badge');
 
   // The skip button stays in the DOM between ads, so require it to be visible.
   let skippable = false;
@@ -153,6 +165,7 @@ _EXTRACT_JS = r"""
     ad_duration: adDuration,
     skippable: skippable,
     skip_text: t('.ytp-skip-ad-button__text'),
+    badge: badge,
     content_time: contentTime,
     content_duration: contentDuration,
     ended: ended,
@@ -602,6 +615,23 @@ def _should_split(current: dict, new_signature: tuple, trigger: str) -> bool:
     return old != new_signature
 
 
+def _is_next_pod_member(previous: float | None, current: float | None) -> bool:
+    """True when the ad's own playhead jumped back towards the start.
+
+    That is the clearest sign YouTube moved on to the next spot in an ad pod, and
+    it is the only one that works when both spots carry the same advertiser card
+    (so the signature never changes). A playhead that is merely *stuttering*, or
+    that reads 0 while the ad media is still loading, must not split an ad, so
+    only a real drop counts.
+    """
+    if previous is None or current is None:
+        return False
+    return (
+        previous - current > POD_RESTART_SECONDS
+        and current <= POD_RESTART_TOLERANCE
+    )
+
+
 class _Tracker:
     """Turns a stream of player snapshots into discrete served-ad records."""
 
@@ -622,8 +652,19 @@ class _Tracker:
                 self._finish(now)
                 self._start(snap, now)
 
+            ad_time = None if snap.get("ad_time") is None else float(snap["ad_time"])
+            if ad_time is not None and _is_next_pod_member(
+                self.current["_last_ad_time"], ad_time
+            ):
+                # Same advertiser card, but the spot's playhead restarted: this is
+                # the next ad of the pod, not a longer first one.
+                logger.info("Pod advanced to the next spot (playhead %.1fs -> %.1fs)",
+                            self.current["_last_ad_time"], ad_time)
+                self._finish(now)
+                self._start(snap, now)
+
             cur = self.current
-            for key in ("advertiser", "destination", "cta"):
+            for key in ("advertiser", "destination", "cta", "badge"):
                 value = _clean(snap.get(key))
                 if value:
                     cur[key] = value
@@ -634,15 +675,18 @@ class _Tracker:
                 cur["content_duration"] = round(float(snap["content_duration"]), 1)
             if snap.get("ad_duration"):
                 cur["duration"] = max(cur["duration"], float(snap["ad_duration"]))
+                cur["duration_from_player"] = True
             if snap.get("skippable") and not cur["skippable"]:
                 cur["skippable"] = True
                 cur["skip_after_s"] = round(now - cur["_started"], 1)
-            if cur["first_seen_media_time"] is None and snap.get("ad_time") is not None:
-                # The player's playhead the first time it admitted an ad was on
-                # screen. It is usually how far into the ad we already are --
-                # the honest measure of how late detection is -- but see
-                # _detection_latency for when it cannot be read that way.
-                cur["first_seen_media_time"] = round(float(snap["ad_time"]), 1)
+            if ad_time is not None:
+                if cur["first_seen_media_time"] is None:
+                    # The player's playhead the first time it admitted an ad was
+                    # on screen. It is usually how far into the ad we already
+                    # are -- the honest measure of how late detection is -- but
+                    # see _detection_latency for when it cannot be read that way.
+                    cur["first_seen_media_time"] = round(ad_time, 1)
+                cur["_last_ad_time"] = ad_time
         else:
             if self.current is not None:
                 self._finish(now)
@@ -676,12 +720,15 @@ class _Tracker:
             "_content_time": self.last_content_time,
             "_trigger": self.trigger,
             "_wall_started": datetime.now().isoformat(timespec="seconds"),
+            "_last_ad_time": None if snap.get("ad_time") is None else float(snap["ad_time"]),
             "advertiser": None,
             "destination": None,
             "cta": None,
+            "badge": _clean(snap.get("badge")),
             "ad_index": snap.get("ad_index"),
             "ad_pod_size": snap.get("ad_pod_size"),
             "duration": float(snap.get("ad_duration") or 0.0),
+            "duration_from_player": bool(snap.get("ad_duration")),
             "content_duration": snap.get("content_duration"),
             "skippable": False,
             "skip_after_s": None,
@@ -714,6 +761,7 @@ class _Tracker:
         ad["observed_seconds"] = round(now - started_elapsed, 1)
         ad["duration"] = round(float(ad.get("duration") or ad["observed_seconds"]), 1)
         ad["placement"] = _classify(ad)
+        ad["format"] = _classify_format(ad)
         ad["detection_latency_s"] = _detection_latency(ad)
         ad["summary"] = _summarize(ad)
         logger.info("Served ad ended (%s, %ss observed)",
@@ -738,6 +786,24 @@ def _classify(ad: dict) -> str:
     if ad.get("content_position", 0.0) <= 1.0:
         return "pre-roll"
     return "mid-roll"
+
+
+def _classify_format(ad: dict) -> str:
+    """Which YouTube ad format the player was showing.
+
+    Read only from what YouTube itself displayed, in the same order a viewer
+    would judge it: a skip button means a *skippable* in-stream ad, a length of
+    a few seconds means a *bumper*, and everything else is an ordinary
+    non-skippable in-stream spot. A short ad only counts as a bumper when the
+    player reported its length; a spot that merely looked short because the
+    session moved on is not guessed at.
+    """
+    claimed = float(ad.get("duration") or 0.0)
+    if ad.get("skippable"):
+        return "skippable in-stream"
+    if ad.get("duration_from_player") and claimed and claimed <= BUMPER_SECONDS:
+        return "bumper"
+    return "non-skippable in-stream"
 
 
 def _detection_latency(ad: dict) -> float | None:
@@ -773,6 +839,8 @@ def _summarize(ad: dict) -> str:
         parts.append(f"-> {ad['destination']}")
     if ad.get("cta"):
         parts.append(f"({ad['cta']})")
+    if ad.get("format"):
+        parts.append(f"[{ad['format']}]")
 
     # The player reports the whole ad pod's length; what we actually watched is
     # often shorter because the sweep moves on. Say both when they disagree.
@@ -782,6 +850,11 @@ def _summarize(ad: dict) -> str:
         parts.append(f"{watched:.0f}s seen (ad claims {claimed:.0f}s)")
     elif claimed:
         parts.append(f"{claimed:.0f}s")
+
+    if ad.get("ad_index") and ad.get("ad_pod_size"):
+        parts.append(f"ad {ad['ad_index']} of {ad['ad_pod_size']}")
+    elif ad.get("ad_pod_size"):
+        parts.append(f"in a pod of {ad['ad_pod_size']}")
 
     if ad.get("skippable"):
         skip = ad.get("skip_after_s")

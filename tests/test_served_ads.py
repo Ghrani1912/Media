@@ -222,6 +222,74 @@ def test_capture_splits_an_ad_pod_into_separate_ads(patched):
     assert report["ad_seconds"] == 25.0
 
 
+def test_back_to_back_identical_ads_split_on_the_ad_playhead(monkeypatch):
+    """Two spots in a row with the same card are still two ads, not one."""
+    tracker = served_ads._Tracker()
+    tracker.update(_snap(True, "Acme", "acme.com", "Shop", duration=15.0,
+                         content_time=0.0, ad_time=0.0), 1.0)
+    tracker.update(_snap(True, "Acme", "acme.com", "Shop", duration=15.0,
+                         content_time=0.0, ad_time=9.0), 2.0)
+    # the playhead restarts: YouTube moved on to the next spot in the pod
+    tracker.update(_snap(True, "Acme", "acme.com", "Shop", duration=15.0,
+                         content_time=0.0, ad_time=0.2), 3.0)
+    tracker.update(_snap(False, content_time=0.0), 4.0)
+
+    assert len(tracker.ads) == 2
+    assert [a["advertiser"] for a in tracker.ads] == ["Acme", "Acme"]
+    assert tracker.ads[0]["duration"] == 15.0
+
+
+def test_a_stuttering_playhead_does_not_split_one_ad(monkeypatch):
+    tracker = served_ads._Tracker()
+    tracker.update(_snap(True, "Acme", "acme.com", duration=20.0, ad_time=0.0), 1.0)
+    tracker.update(_snap(True, "Acme", "acme.com", duration=20.0, ad_time=0.3), 2.0)
+    tracker.update(_snap(True, "Acme", "acme.com", duration=20.0, ad_time=4.2), 3.0)
+    tracker.update(_snap(False, content_time=0.0), 4.0)
+    assert len(tracker.ads) == 1
+
+
+def test_pod_counter_splits_and_labels_each_spot(patched):
+    script, _ = patched
+    script.extend([
+        _snap(True, "Advertiser A", "a.com", index=1, pod=2, duration=10.0,
+              ad_time=0.2),
+        _snap(True, "Advertiser B", "b.com", index=2, pod=2, duration=15.0,
+              ad_time=0.4),
+        _snap(False, content_time=1.0),
+    ])
+    report = served_ads.capture_served_ads("https://youtu.be/x", watch_seconds=200,
+                                           record=False)
+    assert [a["ad_index"] for a in report["ads"]] == [1, 2]
+    assert all(a["ad_pod_size"] == 2 for a in report["ads"])
+    assert "ad 1 of 2" in report["ads"][0]["summary"]
+    assert "ad 2 of 2" in report["ads"][1]["summary"]
+
+
+def test_ad_format_is_read_from_what_youtube_showed():
+    assert served_ads._classify_format(
+        {"skippable": True, "duration": 30.0}) == "skippable in-stream"
+    # a short ad the *player* measured is a bumper
+    assert served_ads._classify_format(
+        {"skippable": False, "duration": 6.0, "duration_from_player": True}
+    ) == "bumper"
+    # the same length, but only observed because the session moved on
+    assert served_ads._classify_format(
+        {"skippable": False, "duration": 6.0}) == "non-skippable in-stream"
+    assert served_ads._classify_format(
+        {"skippable": False, "duration": 45.0, "duration_from_player": True}
+    ) == "non-skippable in-stream"
+
+
+def test_summarize_includes_format_and_pod_position():
+    text = served_ads._summarize({
+        "advertiser": "Acme", "destination": "acme.com", "cta": "Shop",
+        "format": "skippable in-stream", "duration": 30.0,
+        "ad_index": 2, "ad_pod_size": 2, "skippable": True, "skip_after_s": 5.0,
+    })
+    assert "[skippable in-stream]" in text
+    assert "ad 2 of 2" in text
+
+
 def test_capture_classifies_midroll_from_playback_position(patched):
     script, _ = patched
     script.extend([

@@ -137,6 +137,12 @@ ul.ads li {
   text-transform: uppercase;
   letter-spacing: .02em;
 }
+/* second badge on a row (e.g. the served ad's format) */
+.badge.format {
+  background: #ecfdf5;
+  color: #047857;
+  margin-left: .25rem;
+}
 .src { margin-left: auto; color: var(--muted); font-size: .75rem; text-align: right; }
 
 label.checkbox {

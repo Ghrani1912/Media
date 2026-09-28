@@ -121,6 +121,8 @@
                             {% for a in result.served.ads %}
                                 <li>
                                     <span class="badge">{{ a.placement }}</span>
+                                    {% if a.format %}<span class="badge format">{{ a.format }}</span>{% endif %}
+                                    {% if a.ad_index and a.ad_pod_size %}<span class="badge format">ad {{ a.ad_index }} of {{ a.ad_pod_size }}</span>{% endif %}
                                     <strong>{{ a.advertiser or 'Unknown advertiser' }}</strong>
                                     {% if a.destination %} &rarr; {{ a.destination }}{% endif %}
                                     <span class="src">
