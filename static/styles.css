@@ -967,6 +967,90 @@ body {
 
 .report-note { font-family: var(--font-mono); font-size: 12px; color: var(--color-grey); margin-bottom: 16px; }
 
+/* Previous logs */
+.history-block {
+    margin-top: 40px;
+    border: var(--border-thick);
+    background: var(--color-white);
+    padding: 18px 20px;
+}
+
+.history-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    border-bottom: 2px solid var(--color-ink);
+    padding-bottom: 8px;
+    margin-bottom: 12px;
+}
+
+.history-clear-btn {
+    background: var(--color-ink);
+    color: var(--color-white);
+    border: none;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    padding: 4px 10px;
+    cursor: pointer;
+}
+
+.history-clear-btn:hover { background: var(--color-red); }
+
+.history-list { list-style: none; margin: 0; padding: 0; }
+
+.history-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 12px;
+    flex-wrap: wrap;
+    border-bottom: 1px solid var(--color-surface-tint);
+    padding: 7px 0;
+}
+
+.history-row:last-child { border-bottom: none; }
+
+.history-link {
+    display: flex;
+    gap: 12px;
+    align-items: baseline;
+    text-decoration: none;
+    color: var(--color-ink);
+    min-width: 0;
+}
+
+.history-link:hover .history-title { background: var(--color-yellow); }
+
+.history-time {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--color-grey);
+    flex-shrink: 0;
+}
+
+.history-title {
+    font-family: var(--font-display);
+    font-size: 17px;
+    font-weight: 800;
+    text-transform: uppercase;
+    letter-spacing: 0.02em;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 46ch;
+}
+
+.history-meta {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--color-grey);
+    flex-shrink: 0;
+}
+
+.history-error .history-title { color: var(--color-red); }
+
 /* Footer */
 .report-footer {
     border-top: 2px solid var(--color-ink);

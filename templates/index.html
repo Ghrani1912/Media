@@ -322,9 +322,12 @@
 
             <div class="field-group">
                 <label for="link" class="field-label">Media Source Link [YouTube / Twitch]</label>
-                <input type="text" id="link" name="link" class="input-box"
-                       placeholder="Paste a YouTube or Twitch link" aria-describedby="mediaLinkHint">
-                <div id="mediaLinkHint" class="control-description">Accepts live broadcasts, VODs, premiere streams, and direct media manifests.</div>
+                <div class="link-row">
+                    <input type="text" id="link" name="link" class="input-box"
+                           placeholder="Paste a YouTube or Twitch link" aria-describedby="mediaLinkHint">
+                    <button type="submit" class="link-run" aria-label="Analyze this link now">RUN &crarr;</button>
+                </div>
+                <div id="mediaLinkHint" class="control-description">Accepts live broadcasts, VODs, premiere streams, and direct media manifests. Enter also submits.</div>
             </div>
 
             <div class="or-divider" aria-hidden="true"><span>OR</span></div>
@@ -383,6 +386,32 @@
             <p id="analyzeStatus" class="control-description" style="text-align:center;" role="status" aria-live="polite">Full sweep + transcription can take minutes — this bar tracks the real stages.</p>
 
         </form>
+
+        {% if history %}
+        <section class="history-block" aria-labelledby="historyHeading">
+            <div class="history-head">
+                <h2 id="historyHeading" class="eval-block-title">PREVIOUS LOGS</h2>
+                <form method="POST" action="/logs/clear" class="history-clear">
+                    <button type="submit" class="history-clear-btn">CLEAR</button>
+                </form>
+            </div>
+            <ul class="history-list">
+                {% for h in history %}
+                <li class="history-row{% if h.state == 'error' %} history-error{% endif %}">
+                    <a class="history-link" href="/logs/{{ h.id }}">
+                        <span class="history-time">{{ h.time }}</span>
+                        <span class="history-title">{{ h.title }}</span>
+                    </a>
+                    <span class="history-meta">
+                        {{ h.platform }}{% if h.model %} &middot; {{ h.model }}{% endif %}
+                        &middot; {{ h.ads }} sponsor + {{ h.served }} served
+                        {%- if h.state == 'error' %} &middot; FAILED{% endif %}
+                    </span>
+                </li>
+                {% endfor %}
+            </ul>
+        </section>
+        {% endif %}
     </section>
     {% endif %}
 

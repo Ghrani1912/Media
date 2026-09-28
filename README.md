@@ -199,7 +199,7 @@ proof/
 ## Tests
 
 ```
-mediaenv311/Scripts/python.exe -m pytest -q      # 171 passed
+mediaenv311/Scripts/python.exe -m pytest -q      # 179 passed
 ```
 
 Whisper, yt-dlp, Chrome, ffmpeg and the network are all faked, so the suite runs
@@ -228,7 +228,7 @@ a deterministic clock; the Twitch reader through scripted playlists.
 
 ```
 main.py         Flask front-end (/, /analyze + /status/<id> job API, /health,
-                /proof/<file>, /downloads/<file>)
+                /logs/<id> archived logs, /proof/<file>, /downloads/<file>)
 process.py      the pipeline: download -> transcribe -> analyse -> Excel
 ads.py          in-video sponsor detection (SponsorBlock + transcript) + YouTube break schedule
 served_ads.py   YouTube served ads, read from a driven Chrome

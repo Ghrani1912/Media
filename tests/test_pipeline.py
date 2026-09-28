@@ -810,6 +810,114 @@ def test_basename_filter_handles_windows_paths():
     assert main.basename_filter(None) == ""
 
 
+# --------------------------------------------------------------------------- #
+# Log history: finished analyses land in history/ and re-open from the form
+# --------------------------------------------------------------------------- #
+@pytest.fixture
+def history_dir(tmp_path, monkeypatch):
+    import main
+
+    monkeypatch.setattr(main, "HISTORY_DIR", str(tmp_path / "history"))
+    return str(tmp_path / "history")
+
+
+def _history_result():
+    return {
+        "platform": "Twitch", "target": "https://www.twitch.tv/gon_vl",
+        "title": "gon_vl", "transcript": "t", "sentiment": 0.31,
+        "keywords": ["k"], "report": "r.xlsx", "model": "small",
+        "ads": {"ad_count": 2, "ad_seconds": 30, "segments": [], "note": ""},
+        "served": {"ad_count": 1, "ads": [], "note": ""},
+    }
+
+
+def test_finished_job_is_archived_and_listed(monkeypatch, client, history_dir):
+    import main
+
+    monkeypatch.setattr(main, "process_video", lambda **kw: _history_result())
+    job_id = client.post("/analyze", data={"link": "https://www.twitch.tv/gon_vl"}
+                         ).get_json()["job"]
+    final = _wait_for_job(client, job_id)
+    assert final["state"] == "done"
+
+    # archived on disk and listed on the input page
+    assert os.path.exists(os.path.join(history_dir, f"{job_id}.html"))
+    body = client.get("/").data.decode()
+    assert "PREVIOUS LOGS" in body
+    assert f"/logs/{job_id}" in body
+    assert "gon_vl" in body
+
+    # and the archived page opens with the report sheet in it
+    page = client.get(f"/logs/{job_id}")
+    assert page.status_code == 200
+    assert b"BROADCAST RECORD" in page.data
+
+
+def test_sync_post_is_archived_too(monkeypatch, client, history_dir):
+    import main
+
+    monkeypatch.setattr(main, "process_video", lambda **kw: _history_result())
+    client.post("/", data={"link": "https://www.twitch.tv/gon_vl"})
+    entries = main._history_load()
+    assert len(entries) == 1
+    assert entries[0]["platform"] == "Twitch"
+    assert entries[0]["served"] == 1
+
+
+def test_failed_job_is_archived_as_failed(monkeypatch, client, history_dir):
+    import main
+
+    def _boom(**kw):
+        raise RuntimeError("no such channel")
+
+    monkeypatch.setattr(main, "process_video", _boom)
+    job_id = client.post("/analyze", data={"link": "http://x"}).get_json()["job"]
+    assert _wait_for_job(client, job_id)["state"] == "error"
+
+    body = client.get("/").data.decode()
+    assert "FAILED" in body
+    row = [e for e in main._history_load() if e["id"] == job_id][0]
+    assert row["state"] == "error"
+
+
+def test_history_keeps_only_the_newest(monkeypatch, client, history_dir):
+    import main
+
+    monkeypatch.setattr(main, "HISTORY_MAX", 3)
+    monkeypatch.setattr(main, "process_video", lambda **kw: _history_result())
+    kept = []
+    for _ in range(5):
+        job_id = client.post("/analyze", data={"link": "http://x"}
+                             ).get_json()["job"]
+        _wait_for_job(client, job_id)
+        kept.append(job_id)
+
+    ids = [e["id"] for e in main._history_load()]
+    assert ids == list(reversed(kept[-3:]))  # newest first, capped at 3
+    for gone in kept[:2]:
+        assert not os.path.exists(os.path.join(history_dir, f"{gone}.html"))
+
+
+def test_logs_clear_empties_the_archive(monkeypatch, client, history_dir):
+    import main
+
+    monkeypatch.setattr(main, "process_video", lambda **kw: _history_result())
+    job_id = client.post("/analyze", data={"link": "http://x"}).get_json()["job"]
+    _wait_for_job(client, job_id)
+    assert main._history_load()
+
+    r = client.post("/logs/clear")
+    assert r.status_code == 302
+    assert main._history_load() == []
+    assert not os.path.exists(os.path.join(history_dir, f"{job_id}.html"))
+
+
+def test_open_log_rejects_bad_ids(client):
+    assert client.get("/logs/../secret").status_code in (403, 404)
+    assert client.get("/logs/not-a-job-id").status_code == 404
+    assert client.get("/logs/" + "a" * 32).status_code == 404  # well-formed, unknown
+
+
 def test_uploaded_file_removed_after_async_job(client, tmp_path, monkeypatch):
     import main
 

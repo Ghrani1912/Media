@@ -26,6 +26,9 @@ audio.wav
 media_report.xlsx
 uploads/
 
+# Archived analysis logs (rendered report pages + index.json)
+history/
+
 # Served-ad proof clips, thumbnails and manifests. Twitch's creative registry
 # (twitch_ad_creatives.json) and its gallery (creatives.html) live in here too:
 # they record what Twitch served to this machine over time, which is local

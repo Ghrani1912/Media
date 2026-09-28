@@ -6,6 +6,7 @@ the pipeline in ``process.py``, and reports the result.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -13,7 +14,8 @@ import threading
 import time
 import uuid
 
-from flask import Flask, jsonify, render_template, request, send_from_directory
+from flask import (Flask, abort, jsonify, redirect, render_template, request,
+                   send_from_directory)
 from werkzeug.utils import secure_filename
 
 import served_ads
@@ -170,8 +172,13 @@ def _prune_jobs() -> None:
 
 
 def _run_job(job_id: str, **kwargs) -> None:
-    """Worker: run the pipeline, record the outcome, keep the page's data."""
+    """Worker: run the pipeline, record the outcome, keep the page's data.
+
+    The job is marked done/error only after the upload is cleaned up and the
+    log archived, so anything that sees "done" also sees every side effect.
+    """
     file_path = kwargs.get("file_path")
+    state, html, error, summary = "error", None, None, None
     try:
         with app.app_context():  # render_template needs a context; threads don't get one
             result = process_video(job_id=job_id, **kwargs)
@@ -179,16 +186,12 @@ def _run_job(job_id: str, **kwargs) -> None:
             html = render_template(
                 "index.html", result=result,
                 selected_model=kwargs.get("model_name") or WHISPER_MODEL)
-            with _JOBS_LOCK:
-                _JOBS[job_id].update(state="done", html=html,
-                                     finished_at=time.time())
+            state, summary = "done", result
     except Exception as exc:  # the page must show the reason, not spin forever
         logger.exception("Job %s failed", job_id)
+        error = str(exc)
         with app.app_context():
             html = render_template("index.html", error=f"Processing failed: {exc}")
-        with _JOBS_LOCK:
-            _JOBS[job_id].update(state="error", html=html, error=str(exc),
-                                 finished_at=time.time())
     finally:
         # Uploads are transient: the old synchronous path removed them in a
         # finally, and the worker must too.
@@ -197,6 +200,12 @@ def _run_job(job_id: str, **kwargs) -> None:
                 os.remove(file_path)
             except OSError:
                 pass
+        if html is not None:
+            _record_history(job_id, state, html,
+                            summary or {"platform": "", "title": (error or "")[:120]})
+        with _JOBS_LOCK:
+            _JOBS[job_id].update(state=state, html=html, error=error,
+                                 finished_at=time.time())
 
 
 def _pop_unseen_stage(job_id: str) -> dict | None:
@@ -272,6 +281,98 @@ def job_status(job_id: str):
                     "percent": pct, "detail": (stage_info or {}).get("detail", "")})
 
 
+# --------------------------------------------------------------------------- #
+# Log history: every finished analysis is archived as a rendered page plus an
+# index.json line, so past logs can be re-opened from the input page even after
+# a server restart. The dev server's reloader would otherwise wipe _JOBS, and
+# the synchronous POST path never had a handle to re-open anyway.
+# --------------------------------------------------------------------------- #
+HISTORY_DIR = os.environ.get("MEDIA_HISTORY_DIR") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "history"
+)
+HISTORY_MAX = 30  # keep the most recent N logs; older ones are deleted
+
+
+def _history_load() -> list[dict]:
+    path = os.path.join(HISTORY_DIR, "index.json")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            entries = json.load(fh)
+        return entries if isinstance(entries, list) else []
+    except (OSError, ValueError):
+        return []
+
+
+def _history_save(entries: list[dict]) -> None:
+    os.makedirs(HISTORY_DIR, exist_ok=True)
+    path = os.path.join(HISTORY_DIR, "index.json")
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(entries, fh, ensure_ascii=False, indent=1)
+    os.replace(tmp, path)  # atomic-ish: a crash never truncates the index
+
+
+_HISTORY_LOCK = threading.Lock()
+
+
+def _record_history(job_id: str, state: str, html: str, summary: dict) -> None:
+    """Archive one finished analysis (best-effort; never breaks the job)."""
+    try:
+        os.makedirs(HISTORY_DIR, exist_ok=True)
+        page_path = os.path.join(HISTORY_DIR, f"{job_id}.html")
+        with open(page_path, "w", encoding="utf-8") as fh:
+            fh.write(html)
+
+        ads_report = summary.get("ads") or {}
+        served_report = summary.get("served") or {}
+        entry = {
+            "id": job_id,
+            "state": state,
+            "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "epoch": time.time(),
+            "platform": summary.get("platform", ""),
+            "title": summary.get("title") or summary.get("target") or "",
+            "model": summary.get("model", ""),
+            "sentiment": round(float(summary.get("sentiment") or 0.0), 3),
+            "ads": (ads_report.get("ad_count") or 0),
+            "served": (served_report.get("ad_count") or 0),
+        }
+        with _HISTORY_LOCK:  # concurrent workers share the index read-modify-write
+            entries = [e for e in _history_load() if e.get("id") != job_id]
+            entries.insert(0, entry)
+            dropped = entries[HISTORY_MAX:]
+            entries = entries[:HISTORY_MAX]
+            _history_save(entries)
+        for old in dropped:
+            try:
+                os.remove(os.path.join(HISTORY_DIR, f"{old.get('id')}.html"))
+            except OSError:
+                pass
+    except Exception:
+        logger.exception("Could not archive log %s", job_id)
+
+
+@app.get("/logs/<job_id>")
+def open_log(job_id: str):
+    """Serve an archived log page (its own self-contained report sheet)."""
+    if not re.fullmatch(r"[0-9a-f]{32}", job_id or ""):
+        abort(404)
+    return send_from_directory(HISTORY_DIR, f"{job_id}.html")
+
+
+@app.post("/logs/clear")
+def clear_logs():
+    """Forget all archived logs (used by the PREVIOUS LOGS 'CLEAR' button)."""
+    if os.path.isdir(HISTORY_DIR):
+        for name in os.listdir(HISTORY_DIR):
+            if name.endswith(".html") or name == "index.json":
+                try:
+                    os.remove(os.path.join(HISTORY_DIR, name))
+                except OSError:
+                    pass
+    return redirect("/")
+
+
 def _unique_path(filename: str) -> str:
     """Return a collision-free path so concurrent uploads never overwrite."""
     safe = secure_filename(filename) or "upload"
@@ -281,7 +382,7 @@ def _unique_path(filename: str) -> str:
 @app.route("/", methods=["GET", "POST"])
 def index():
     if request.method == "GET":
-        return render_template("index.html")
+        return render_template("index.html", history=_history_load())
 
     link = (request.form.get("link") or "").strip()
     file = request.files.get("file")
@@ -322,12 +423,16 @@ def index():
 
     except Exception as exc:  # surface the real reason instead of a blank page
         logger.exception("Processing failed")
-        return render_template("index.html", error=f"Processing failed: {exc}"), 500
+        return render_template("index.html", error=f"Processing failed: {exc}",
+                               history=_history_load()), 500
 
     result["title"] = _display_title(link, uploaded_path)
-    # Rendered server-side for non-JS clients; the browser JS uses /analyze.
-    return render_template("index.html", result=result,
+    html = render_template("index.html", result=result,
                            selected_model=model or WHISPER_MODEL)
+    # Rendered server-side for non-JS clients; the browser JS uses /analyze.
+    # Archive it too, so the log is re-openable from PREVIOUS LOGS later.
+    _record_history(uuid.uuid4().hex, "done", html, result)
+    return html
 
 
 @app.errorhandler(413)
@@ -337,6 +442,7 @@ def too_large(_exc):
             "index.html",
             error=f"File is too large. Maximum upload size is "
             f"{MAX_CONTENT_LENGTH // (1024 * 1024)} MB.",
+            history=_history_load(),
         ),
         413,
     )
