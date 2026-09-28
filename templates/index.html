@@ -39,7 +39,8 @@
                 <span class="checkbox-body">
                     Capture the ads YouTube actually plays
                     <span class="hint">Opens a Chrome window, sweeps the whole video to
-                        catch pre-rolls and mid-rolls, and saves a proof clip of each ad.
+                        catch pre-rolls and mid-rolls, and saves a proof clip of each ad
+                        plus frames from just before it appeared and just after it ended.
                         YouTube links only. Use SERVED_ADS_FULL=1 to play it all in
                         real time instead of sweeping.</span>
                 </span>
@@ -139,12 +140,20 @@
                                             &middot; {{ '%.1f'|format(a.get('elapsed_s') or 0) }}s into the session
                                         {%- endif %}
                                         {%- if a.get('trigger') and a.trigger.startswith('seek') %} (triggered by {{ a.trigger }}){% endif %}
+                                        {%- if a.get('detection_latency_s') is not none %} &middot; first spotted {{ '%.1f'|format(a.detection_latency_s) }}s into the ad{% endif %}
                                     </span>
                                     {% if a.clip or a.thumbnail %}
                                         <span class="hint ad-proof">
                                             proof:
                                             {%- if a.clip %} <code>{{ a.clip }}</code>{% endif %}
                                             {%- if a.thumbnail %} <code>{{ a.thumbnail }}</code>{% endif %}
+                                        </span>
+                                    {% endif %}
+                                    {% if a.get('frame_before') or a.get('frame_after') %}
+                                        <span class="hint ad-proof">
+                                            boundary frames:
+                                            {%- if a.get('frame_before') %} before {{ '%.1f'|format(a.get('before_frame_s') or 0) }}s <code>{{ a.frame_before }}</code>{% endif %}
+                                            {%- if a.get('frame_after') %} &middot; after {{ '%.1f'|format(a.get('after_frame_s') or 0) }}s <code>{{ a.frame_after }}</code>{% endif %}
                                         </span>
                                     {% endif %}
                                 </li>

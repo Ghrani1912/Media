@@ -24,10 +24,15 @@ serve that break's ad, so a few minutes of sweeping covers the full runtime. Pas
 
 Proof clips
 -----------
-With ``proof_dir`` set, every captured ad is screenshot once a second while it
-plays. The frames are stitched into a short mp4 (and a thumbnail), so the ad can
-be watched back and judged. A ``manifest.json`` records the metadata, the video
-timeline position, and the wall-clock time of each ad.
+With ``proof_dir`` set the player is screenshotted on *every* poll -- while an ad
+plays and for a second or two either side of it -- so the transition from content
+into the ad and back is on record. Each ad is saved as a labelled sequence
+(``before``, ``start``, ``mid``, ``end``, ``after``) and stitched into a short
+mp4. Read together with ``first_seen_ad_time`` -- how far into the ad's own
+playback the player already was on the first poll that admitted an ad was on
+screen -- that shows whether detection fires the moment the ad starts or only
+partway through it. A ``manifest.json`` records the metadata, the video timeline
+position, the wall-clock time, and the frame timings of each ad.
 
 Requires: ``selenium`` and Google Chrome (or Edge); ``ffmpeg`` for the clips.
 """
@@ -55,6 +60,14 @@ DEFAULT_PROOF_DIR = os.environ.get("SERVED_ADS_PROOF_DIR") or os.path.join(
 PRE_ROLL_SECONDS = float(os.environ.get("SERVED_ADS_PRE_ROLL_SECONDS", "35"))
 # Time spent parked at each seek stop, waiting for a mid-roll break to fire.
 SEEK_DWELL_SECONDS = float(os.environ.get("SERVED_ADS_SEEK_DWELL", "14"))
+# Once an ad does fire, the sweep keeps waiting for it (and for the content that
+# follows) rather than moving on, so the whole ad is on record. This is the cap
+# that stops a stuck ad from eating the whole budget.
+AD_WAIT_SECONDS = float(os.environ.get("SERVED_ADS_AD_WAIT", "120"))
+# How long to film the page settling, before any watch window starts. The pre-roll
+# often begins in these first seconds, so they are the only chance to catch what
+# it interrupted.
+WARMUP_SECONDS = float(os.environ.get("SERVED_ADS_WARMUP", "8"))
 # How far to jump between seek stops.
 SEEK_STEP_SECONDS = float(os.environ.get("SERVED_ADS_SEEK_STEP", "120"))
 # Safety ceiling for a single capture.
@@ -66,6 +79,13 @@ HEADLESS = os.environ.get("SERVED_ADS_HEADLESS", "").strip().lower() in {"1", "t
 FULL_WATCH = os.environ.get("SERVED_ADS_FULL", "").strip().lower() in {"1", "true", "yes"}
 # Record proof clips by default; disable with SERVED_ADS_RECORD=0.
 RECORD = os.environ.get("SERVED_ADS_RECORD", "1").strip().lower() not in {"0", "false", "no"}
+# Frames kept from *before* an ad is noticed (a rolling lead-in), so the moment
+# content turns into an ad is on record. At one poll per second this is ~3s.
+BUFFER_FRAMES = max(1, int(os.environ.get("SERVED_ADS_BUFFER_FRAMES", "3")))
+# How long to keep filming after an ad ends, to catch the return to content.
+POST_ROLL_SECONDS = float(os.environ.get("SERVED_ADS_POST_ROLL_SECONDS", "2"))
+# Which lead-in/lead-out frame to keep as the labelled boundary snapshot.
+BOUNDARY_SECONDS = float(os.environ.get("SERVED_ADS_BOUNDARY_SECONDS", "1"))
 
 # A persistent profile makes each capture look like a returning visitor (so the
 # consent dialog is answered only once) instead of a brand-new automated session.
@@ -111,6 +131,8 @@ _EXTRACT_JS = r"""
     if (skipEl) { const r = skipEl.getBoundingClientRect(); skippable = r.width > 0 && r.height > 0; }
   } catch (e) {}
 
+  // While an ad plays the video element is the ad, so currentTime is how far
+  // into the ad we already are -- i.e. how late detection is.
   let adTime = null, adDuration = null;
   try {
     if (video && !isNaN(video.currentTime)) adTime = video.currentTime;
@@ -127,6 +149,7 @@ _EXTRACT_JS = r"""
     cta: t('.ytp-ad-button-vm__text'),
     ad_index: pod ? parseInt(pod[1], 10) : null,
     ad_pod_size: pod ? parseInt(pod[2], 10) : null,
+    ad_time: adTime,
     ad_duration: adDuration,
     skippable: skippable,
     skip_text: t('.ytp-skip-ad-button__text'),
@@ -257,6 +280,16 @@ def _dismiss_consent(driver) -> None:
             return
 
 
+def _play(driver) -> None:
+    """Press play: a paused ad or a stalled playhead would hold a session open."""
+    try:
+        driver.execute_script(
+            "const v=document.querySelector('video'); if (v && v.paused) v.play();"
+        )
+    except Exception as exc:
+        logger.debug("play nudge failed: %s", exc)
+
+
 def _seek(driver, position: float) -> None:
     """Jump the content video to ``position`` seconds."""
     try:
@@ -277,60 +310,217 @@ def _slug(value: str | None, fallback: str = "ad") -> str:
 
 
 class _ClipRecorder:
-    """Screenshots an ad while it plays and stitches the frames into an mp4."""
+    """Films the player every poll and stitches labelled proof frames.
+
+    Frames are captured whether or not an ad is on screen: a rolling buffer keeps
+    the content immediately *before* an ad, and filming carries on briefly after
+    it ends. A finished ad therefore becomes a labelled sequence -- ``before``,
+    ``start``, ``mid``, ``end``, ``after`` -- which, read alongside
+    ``first_seen_ad_time`` (how far into the ad's own playback the first poll
+    that showed an ad already was), shows whether detection fires the moment the
+    ad starts or only somewhere in the middle of it.
+    """
 
     def __init__(self, proof_dir: str, video_id: str | None, enabled: bool = True):
         self.proof_dir = proof_dir
         self.video_id = video_id or "video"
         self.enabled = enabled
-        self.frames_dir: str | None = None
-        self.frames: list[str] = []
         self.rect: dict | None = None
+        self.frames_dir: str | None = None
+        self.counter = 0
+        self.tracked: set[str] = set()
+        self.buffer: list[dict] = []
+        self.active: dict | None = None
+        self.pending: list[dict] = []
+        self.checkpoint_frame: dict | None = None
         os.makedirs(self.proof_dir, exist_ok=True)
 
-    def begin(self, rect) -> None:
+    # -- capture ---------------------------------------------------------- #
+    def _next_frame_path(self) -> str:
+        if self.frames_dir is None:
+            self.frames_dir = os.path.join(
+                tempfile.gettempdir(), "media_analyzer", f"adframes_{uuid.uuid4().hex[:8]}"
+            )
+            os.makedirs(self.frames_dir, exist_ok=True)
+        path = os.path.join(self.frames_dir, f"frame_{self.counter:05d}.png")
+        self.counter += 1
+        self.tracked.add(path)
+        return path
+
+    def tick(self, driver, now: float, showing: bool, rect=None) -> None:
+        """Capture one frame. Call on *every* poll, ad or no ad."""
         if not self.enabled:
             return
-        self.rect = rect or None
-        self.frames_dir = os.path.join(
-            tempfile.gettempdir(), "media_analyzer", f"adframes_{uuid.uuid4().hex[:8]}"
-        )
-        os.makedirs(self.frames_dir, exist_ok=True)
-        self.frames = []
-
-    def capture(self, driver) -> None:
-        if not self.enabled or not self.frames_dir:
-            return
-        path = os.path.join(self.frames_dir, f"frame_{len(self.frames):04d}.png")
+        if rect and float(rect.get("w") or 0) > 0:
+            self.rect = rect
+        path = self._next_frame_path()
         try:
             driver.save_screenshot(path)
-            self.frames.append(path)
         except Exception as exc:
             logger.debug("ad screenshot failed: %s", exc)
+            self._forget(path)
+            return
+        frame = {"path": path, "t": float(now), "showing": bool(showing)}
+        self.buffer.append(frame)
+        self.buffer = self.buffer[-BUFFER_FRAMES:]
+        if self.active is not None:
+            self.active["frames"].append(frame)
+        for entry in self.pending:
+            if entry.get("frozen") is not None:
+                continue
+            if float(now) - entry["ended"] <= POST_ROLL_SECONDS:
+                entry["frames"].append(frame)
+        self._prune()
 
-    def finish(self, ad: dict, index: int) -> dict:
-        """Return {clip, thumbnail, frames} paths for a finished ad."""
-        result = {"clip": None, "thumbnail": None, "frames": 0}
-        if not self.enabled or not self.frames:
-            self._cleanup()
-            return result
+    def begin(self, rect, now: float) -> None:
+        """An ad was just noticed: start a sequence, seeded with the lead-in."""
+        if not self.enabled:
+            return
+        if rect and float(rect.get("w") or 0) > 0:
+            self.rect = rect
+        seed = [f for f in self.buffer if not f["showing"]]
+        if not seed and self.checkpoint_frame is not None:
+            seed = [dict(self.checkpoint_frame)]
+        self.active = {"frames": seed, "started": float(now)}
 
-        result["frames"] = len(self.frames)
-        stem = os.path.join(
-            self.proof_dir,
-            f"{self.video_id}_ad{index:02d}_{_slug(ad.get('advertiser'))}",
-        )
+    def checkpoint(self, driver, now: float) -> None:
+        """Stash the current frame as the lead-in for an ad that may follow.
+
+        A seek serves the next break's ad almost immediately, so no frame of the
+        content at the new position is ever drawn. The last content frame before
+        the jump is then the best available "just before the ad" evidence.
+        """
+        if not self.enabled:
+            return
+        path = self._next_frame_path()
         try:
-            shutil.copyfile(self.frames[0], stem + "_thumb.png")
-            result["thumbnail"] = stem + "_thumb.png"
+            driver.save_screenshot(path)
+        except Exception as exc:
+            logger.debug("checkpoint screenshot failed: %s", exc)
+            self._forget(path)
+            return
+        if self.checkpoint_frame is not None:
+            self._forget(self.checkpoint_frame["path"])
+        self.checkpoint_frame = {"path": path, "t": float(now), "showing": False}
+
+    def freeze(self) -> None:
+        """Stop filming post-roll frames: the playhead is about to jump away."""
+        for entry in self.pending:
+            entry.setdefault("frozen", len(entry["frames"]))
+
+    def finish(self, ad: dict, index: int, now: float) -> None:
+        """The ad left the screen; keep filming briefly to catch the return."""
+        if not self.enabled:
+            return
+        active = self.active
+        self.active = None
+        if active and active["frames"]:
+            self.pending.append(
+                {"ad": ad, "index": index, "frames": active["frames"], "ended": float(now)}
+            )
+
+    def flush_ready(self, now: float, force: bool = False) -> None:
+        """Write out every ad whose post-roll window has finished filming."""
+        if not self.enabled:
+            return
+        waiting = []
+        for entry in self.pending:
+            if force or float(now) - entry["ended"] >= POST_ROLL_SECONDS:
+                self._write(entry)
+            else:
+                waiting.append(entry)
+        self.pending = waiting
+
+    def close(self, now: float) -> None:
+        if not self.enabled:
+            return
+        self.flush_ready(now, force=True)
+        if self.frames_dir:
+            shutil.rmtree(self.frames_dir, ignore_errors=True)
+        self.frames_dir = None
+        self.tracked.clear()
+        self.buffer = []
+
+    # -- internals -------------------------------------------------------- #
+    def _entry_frames(self, entry: dict) -> list[dict]:
+        """Frames belonging to an ad; a freeze cuts off anything filmed later."""
+        frames = entry["frames"]
+        frozen = entry.get("frozen")
+        return frames[:frozen] if frozen is not None else frames
+
+    def _kept_paths(self) -> set[str]:
+        kept = {f["path"] for f in self.buffer}
+        if self.checkpoint_frame is not None:
+            kept.add(self.checkpoint_frame["path"])
+        if self.active is not None:
+            kept.update(f["path"] for f in self.active["frames"])
+        for entry in self.pending:
+            kept.update(f["path"] for f in self._entry_frames(entry))
+        return kept
+
+    def _prune(self) -> None:
+        """Drop frames that have fallen out of every window (keeps temp small)."""
+        for path in list(self.tracked - self._kept_paths()):
+            self._forget(path)
+
+    def _forget(self, path: str) -> None:
+        self.tracked.discard(path)
+        try:
+            os.remove(path)
         except OSError:
             pass
 
-        if len(self.frames) >= 2 and _ffmpeg_available():
+    def _write(self, entry: dict) -> None:
+        """Save the labelled frames for one ad and stitch them into a clip."""
+        ad = entry["ad"]
+        frames = self._entry_frames(entry)
+        shown = [f for f in frames if f["showing"]]
+        if len(frames) < 2 or not shown:
+            return
+
+        first, last = shown[0], shown[-1]
+        lead_in = [f for f in frames if not f["showing"] and f["t"] < first["t"]]
+        lead_out = [f for f in frames if not f["showing"] and f["t"] > last["t"]]
+
+        stem = os.path.join(
+            self.proof_dir,
+            f"{self.video_id}_ad{entry['index']:02d}_{_slug(ad.get('advertiser'))}",
+        )
+        sequence = [
+            ("before", _closest(lead_in, first["t"] - BOUNDARY_SECONDS)),
+            ("start", first),
+            ("mid", shown[len(shown) // 2]),
+            ("end", last),
+            ("after", _closest(lead_out, last["t"] + BOUNDARY_SECONDS)),
+        ]
+        for position, (label, frame) in enumerate(sequence):
+            if frame is None:
+                continue
+            target = f"{stem}_{position}_{label}.png"
+            try:
+                shutil.copyfile(frame["path"], target)
+            except OSError as exc:
+                logger.debug("could not save %s frame: %s", label, exc)
+                continue
+            ad[f"frame_{label}"] = target
+            if label == "start":
+                ad["thumbnail"] = target
+
+        ad["clip"] = None
+        ad["frames"] = len(frames)
+        ad["ad_frames"] = len(shown)
+        ad["ad_started_at"] = round(first["t"], 1)
+        ad["ad_ended_at"] = round(last["t"], 1)
+        ad["before_frame_s"] = round(first["t"] - lead_in[-1]["t"], 1) if lead_in else None
+        ad["after_frame_s"] = round(lead_out[0]["t"] - last["t"], 1) if lead_out else None
+
+        if _ffmpeg_available() and self.frames_dir:
             clip = stem + ".mp4"
             cmd = [
                 "ffmpeg", "-y", "-loglevel", "error",
-                "-framerate", "1", "-i", os.path.join(self.frames_dir, "frame_%04d.png"),
+                "-framerate", "1",
+                "-start_number", str(_frame_number(frames[0]["path"])),
+                "-i", os.path.join(self.frames_dir, "frame_%05d.png"),
             ]
             crop = _crop_filter(self.rect)
             if crop:
@@ -339,20 +529,23 @@ class _ClipRecorder:
             try:
                 done = subprocess.run(cmd, capture_output=True, text=True)
                 if done.returncode == 0 and os.path.exists(clip):
-                    result["clip"] = clip
+                    ad["clip"] = clip
                 else:
                     logger.debug("ffmpeg clip failed: %s", (done.stderr or "")[-300:])
             except Exception as exc:
                 logger.debug("ffmpeg clip failed: %s", exc)
 
-        self._cleanup()
-        return result
 
-    def _cleanup(self) -> None:
-        if self.frames_dir:
-            shutil.rmtree(self.frames_dir, ignore_errors=True)
-        self.frames_dir = None
-        self.frames = []
+def _closest(frames: list[dict], target: float) -> dict | None:
+    """The frame nearest ``target`` seconds on the session clock."""
+    if not frames:
+        return None
+    return min(frames, key=lambda frame: abs(frame["t"] - target))
+
+
+def _frame_number(path: str) -> int:
+    match = re.search(r"(\d+)", os.path.basename(path or ""))
+    return int(match.group(1)) if match else 1
 
 
 def _crop_filter(rect) -> str | None:
@@ -421,7 +614,8 @@ class _Tracker:
         self.trigger = "playback"
 
     def update(self, snap: dict, now: float) -> None:
-        if snap.get("showing"):
+        showing = bool(snap.get("showing"))
+        if showing:
             if self.current is None:
                 self._start(snap, now)
             elif _should_split(self.current, _signature(snap), self.trigger):
@@ -443,13 +637,37 @@ class _Tracker:
             if snap.get("skippable") and not cur["skippable"]:
                 cur["skippable"] = True
                 cur["skip_after_s"] = round(now - cur["_started"], 1)
-            if self.recorder:
-                self.recorder.capture(self.driver)
+            if cur["first_seen_media_time"] is None and snap.get("ad_time") is not None:
+                # The player's playhead the first time it admitted an ad was on
+                # screen. It is usually how far into the ad we already are --
+                # the honest measure of how late detection is -- but see
+                # _detection_latency for when it cannot be read that way.
+                cur["first_seen_media_time"] = round(float(snap["ad_time"]), 1)
         else:
             if self.current is not None:
                 self._finish(now)
             if snap.get("content_time") is not None:
                 self.last_content_time = float(snap["content_time"])
+
+        # Film on every poll -- including the quiet stretches either side of an
+        # ad -- so the proof frames capture the moment the ad appears and goes.
+        if self.recorder is not None:
+            self.recorder.tick(self.driver, now, showing, snap.get("player_rect"))
+            self.recorder.flush_ready(now)
+
+    def freeze(self) -> None:
+        """The playhead is about to jump, so stop filming the current context."""
+        if self.recorder is not None:
+            self.recorder.freeze()
+
+    def checkpoint(self, driver, now: float) -> None:
+        """Photograph the content just before the playhead moves.
+
+        Skipped while an ad is on screen, because then the frame would show that
+        ad rather than the content leading into the next one.
+        """
+        if self.recorder is not None and self.current is None:
+            self.recorder.checkpoint(driver, now)
 
     def _start(self, snap: dict, now: float) -> None:
         self.current = {
@@ -467,10 +685,11 @@ class _Tracker:
             "content_duration": snap.get("content_duration"),
             "skippable": False,
             "skip_after_s": None,
+            "first_seen_media_time": None,
             "trigger": self.trigger,
         }
         if self.recorder:
-            self.recorder.begin(snap.get("player_rect"))
+            self.recorder.begin(snap.get("player_rect"), now)
         logger.info("Served ad started (%s, trigger=%s)", self.current["_signature"], self.trigger)
 
     def _finish(self, now: float) -> None:
@@ -495,14 +714,21 @@ class _Tracker:
         ad["observed_seconds"] = round(now - started_elapsed, 1)
         ad["duration"] = round(float(ad.get("duration") or ad["observed_seconds"]), 1)
         ad["placement"] = _classify(ad)
-        if self.recorder:
-            ad.update(self.recorder.finish(ad, len(self.ads) + 1))
+        ad["detection_latency_s"] = _detection_latency(ad)
         ad["summary"] = _summarize(ad)
+        logger.info("Served ad ended (%s, %ss observed)",
+                    ad.get("advertiser") or "unknown", ad["observed_seconds"])
         self.ads.append(ad)
+        if self.recorder:
+            # Clip paths and frame timings are attached once the post-roll
+            # frames have been filmed, so the record is patched in place.
+            self.recorder.finish(ad, len(self.ads), now)
 
     def close(self, now: float) -> None:
         if self.current is not None:
             self._finish(now)
+        if self.recorder:
+            self.recorder.close(now)
 
 
 def _classify(ad: dict) -> str:
@@ -512,6 +738,32 @@ def _classify(ad: dict) -> str:
     if ad.get("content_position", 0.0) <= 1.0:
         return "pre-roll"
     return "mid-roll"
+
+
+def _detection_latency(ad: dict) -> float | None:
+    """How far into the ad we already were on the first poll that saw it.
+
+    That reading comes from the player's playhead, which is only meaningful while
+    the ad's own media is loaded into the video element. A break served by a seek
+    can be spotted before the ad media takes over, and then the playhead still
+    reports the *content* position -- so a reading at or beyond the ad's own
+    length is not a latency and is dropped rather than reported as one.
+    """
+    raw = ad.get("first_seen_media_time")
+    if raw is None:
+        return None
+    raw = float(raw)
+    claimed = float(ad.get("duration") or 0.0)
+    if raw < 0 or (claimed and raw >= claimed):
+        return None
+    # A break served by a seek is spotted while the playhead still reads the
+    # content position it just jumped to (the ad media has not taken over yet).
+    # That number is the break's position, not a latency.
+    position = ad.get("content_position")
+    if position is not None and ad.get("placement") != "pre-roll":
+        if abs(raw - float(position)) <= 1.5:
+            return None
+    return round(raw, 1)
 
 
 def _summarize(ad: dict) -> str:
@@ -534,12 +786,37 @@ def _summarize(ad: dict) -> str:
     if ad.get("skippable"):
         skip = ad.get("skip_after_s")
         parts.append(f"skippable after {skip}s" if skip else "skippable")
+
+    # How late the ad was spotted: on the first poll that showed an ad the player
+    # was already this far into the ad itself.
+    latency = ad.get("detection_latency_s")
+    if latency is not None:
+        parts.append(f"noticed {float(latency):.1f}s into the ad")
     return " ".join(parts)
 
 
 # --------------------------------------------------------------------------- #
 # Watch strategies
 # --------------------------------------------------------------------------- #
+def _warmup(driver, tracker: _Tracker, deadline: float, started: float) -> None:
+    """Film the opening moments, before any watch window starts.
+
+    The pre-roll usually starts while the watch page is still settling, so those
+    first frames are the only record of the content the ad interrupted -- sleeping
+    through them leaves every pre-roll without its "just before" evidence. A
+    consent dialog that renders late would block playback entirely, so it is
+    dismissed again for as long as the player has not appeared.
+    """
+    until = min(deadline, time.time() + WARMUP_SECONDS)
+    while time.time() < until:
+        snap = _poll(driver)
+        if snap is not None:
+            if snap.get("player_rect") is None and not snap.get("showing"):
+                _dismiss_consent(driver)
+            tracker.update(snap, time.time() - started)
+        time.sleep(1.0)
+
+
 def _linear_watch(driver, tracker: _Tracker, deadline: float, started: float) -> None:
     """Poll every second until the deadline (used when a budget is given)."""
     while time.time() < deadline:
@@ -566,28 +843,55 @@ def _full_watch(driver, tracker: _Tracker, deadline: float, started: float) -> N
                 stalled = stalled + 1 if abs(pos - last) < 0.05 else 0
                 last = pos
                 if stalled >= 3:
-                    try:
-                        driver.execute_script(
-                            "const v=document.querySelector('video'); if (v && v.paused) v.play();"
-                        )
-                    except Exception:
-                        pass
+                    _play(driver)
                     stalled = 0
         time.sleep(1.0)
+
+
+def _watch_window(driver, tracker: _Tracker, deadline: float, started: float,
+                  seconds: float) -> float | None:
+    """Poll for ``seconds`` -- but never walk away from an ad that is playing.
+
+    Leaving mid-ad would cut the ad out of its own proof clip and, worse, hide the
+    return to content, which is half of what the recording exists to show. So the
+    window stretches while an ad is on screen (capped by ``AD_WAIT_SECONDS``) and
+    closes a moment after the content comes back. Returns the content duration if
+    the player reported one.
+    """
+    duration = None
+    stop_until = min(deadline, time.time() + seconds)
+    ad_deadline = None
+    waiting_on_ad = False
+    while time.time() < stop_until:
+        snap = _poll(driver)
+        if snap is not None:
+            tracker.update(snap, time.time() - started)
+            if snap.get("content_duration"):
+                duration = float(snap["content_duration"])
+            if snap.get("showing"):
+                if not waiting_on_ad:
+                    # An absolute cap, fixed when the break starts: an ad that
+                    # never reports itself finished must not hold us here for the
+                    # whole budget.
+                    ad_deadline = time.time() + AD_WAIT_SECONDS
+                    logger.info("holding the watch window open for a served ad")
+                waiting_on_ad = True
+                stop_until = min(deadline, ad_deadline)
+                if snap.get("paused"):
+                    _play(driver)
+            elif waiting_on_ad:
+                waiting_on_ad = False
+                stop_until = min(deadline, time.time() + POST_ROLL_SECONDS + 1)
+        time.sleep(1.0)
+    return duration
 
 
 def _sweep_watch(driver, tracker: _Tracker, deadline: float, started: float) -> dict:
     """Watch the opening, then seek along the timeline to trigger mid-rolls."""
     info = {"seek_stops": 0, "content_duration": None}
-
-    pre_roll_deadline = min(deadline, started + PRE_ROLL_SECONDS)
-    while time.time() < pre_roll_deadline:
-        snap = _poll(driver)
-        if snap is not None:
-            tracker.update(snap, time.time() - started)
-            if snap.get("content_duration"):
-                info["content_duration"] = float(snap["content_duration"])
-        time.sleep(1.0)
+    info["content_duration"] = _watch_window(
+        driver, tracker, deadline, started, PRE_ROLL_SECONDS
+    )
 
     duration = info["content_duration"]
     if not duration:
@@ -597,14 +901,11 @@ def _sweep_watch(driver, tracker: _Tracker, deadline: float, started: float) -> 
         if time.time() >= deadline:
             break
         tracker.trigger = f"seek@{int(position)}"
+        tracker.freeze()  # post-roll frames from the old position are not evidence
+        tracker.checkpoint(driver, time.time() - started)
         _seek(driver, position)
         info["seek_stops"] += 1
-        stop_until = min(deadline, time.time() + SEEK_DWELL_SECONDS)
-        while time.time() < stop_until:
-            snap = _poll(driver)
-            if snap is not None:
-                tracker.update(snap, time.time() - started)
-            time.sleep(1.0)
+        _watch_window(driver, tracker, deadline, started, SEEK_DWELL_SECONDS)
         tracker.trigger = "playback"
     return info
 
@@ -700,18 +1001,14 @@ def capture_served_ads(url: str, watch_seconds: float | None = None,
         logger.info("Serving ads: opening %s (strategy=%s, budget=%ss)",
                     url, strategy, int(budget))
         driver.get(url)
-        time.sleep(4)
-        _dismiss_consent(driver)
-        try:
-            driver.execute_script(
-                "const v=document.querySelector('video'); if (v && v.paused) v.play();"
-            )
-        except Exception:
-            pass
 
+        # The clock starts with the page, not with playback: the pre-roll can
+        # begin during the load, and those first seconds are evidence.
         started = time.time()
         deadline = started + budget
         tracker = _Tracker(recorder=recorder, driver=driver)
+        _warmup(driver, tracker, deadline, started)
+        _play(driver)
 
         extra: dict = {}
         if strategy == "window":
@@ -793,6 +1090,40 @@ def _write_manifest(recorder, url, video_id, ads, result, strategy) -> str | Non
     return path
 
 
+_LABELS = ("before", "start", "mid", "end", "after")
+
+
+def _label_caption(label: str, ad: dict) -> str:
+    """Caption a boundary frame with how far it sits from the ad's edges."""
+    if label == "before":
+        delta = ad.get("before_frame_s")
+        return "content just before" if delta is None else f"content {delta}s before"
+    if label == "start":
+        latency = ad.get("detection_latency_s")
+        seen = "unknown" if latency is None else f"{float(latency):.1f}s"
+        return f"first ad frame detected ({seen} into the ad)"
+    if label == "end":
+        return "last ad frame"
+    if label == "after":
+        delta = ad.get("after_frame_s")
+        return "content after" if delta is None else f"content {delta}s after"
+    return "mid-ad"
+
+
+def _frame_strip(ad: dict) -> str:
+    """The before / start / mid / end / after frames for one ad, in order."""
+    cells = []
+    for label in _LABELS:
+        name = ad.get(f"frame_{label}")
+        if not name:
+            continue
+        cells.append(
+            f'<figure><img src="{os.path.basename(name)}" alt="{label} ad frame">'
+            f"<figcaption><b>{label}</b> &middot; {_label_caption(label, ad)}</figcaption></figure>"
+        )
+    return f'<div class="strip">{"".join(cells)}</div>' if cells else ""
+
+
 def _write_index(recorder, url: str, ads) -> str | None:
     """Write a browsable ``index.html`` so the proof clips can be reviewed."""
     if recorder is None or not ads:
@@ -812,6 +1143,7 @@ def _write_index(recorder, url: str, ads) -> str | None:
             f'<div class="when">{ad.get("placement")} at {format_timeline(ad)} '
             f'&middot; {ad.get("wall_started_at")}</div>'
             f"<div class=\"meta\">{ad.get('summary', '')}</div>"
+            f"{_frame_strip(ad)}"
             f"{media}</li>"
         )
     html = (
@@ -820,7 +1152,12 @@ def _write_index(recorder, url: str, ads) -> str | None:
         "<style>body{font:14px system-ui;margin:0;padding:20px;background:#0f1115;color:#e8eaf0}"
         "li{list-style:none;margin:0 0 24px;padding:14px;background:#171a21;border-radius:10px}"
         ".when{font-weight:600} .meta{color:#9aa3b2;margin:4px 0 10px}"
-        "video,img{width:100%;max-width:900px;border-radius:6px;display:block}</style>"
+        "video,img{width:100%;max-width:900px;border-radius:6px;display:block}"
+        ".strip{display:flex;gap:8px;overflow-x:auto;margin:0 0 12px}"
+        ".strip figure{margin:0;flex:0 0 220px}"
+        ".strip img{border-radius:4px;border:1px solid #2a2f3a}"
+        ".strip figcaption{color:#9aa3b2;font-size:12px;margin-top:4px}"
+        ".strip b{color:#e8eaf0}</style>"
         f"<h1>Served ads for {recorder.video_id}</h1>"
         f"<p class='meta'>Source: {url}</p><ul>" + "".join(rows) + "</ul>"
     )
