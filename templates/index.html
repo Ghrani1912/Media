@@ -33,13 +33,8 @@
     <!-- ================================================== -->
     <!-- RESULTS VIEW (Broadcast Log Sheet)                  -->
     <!-- ================================================== -->
-    <div class="collapsed-strip">
-        <div class="collapsed-source">
-            <span class="rec-dot" aria-hidden="true"></span>
-            <span>SOURCE: <strong>{{ result.platform }} // {{ result.title }}</strong></span>
-            <span>STATUS: <strong>LOG COMPILED</strong></span>
-        </div>
-        <a href="/" class="btn-new-analysis">NEW ANALYSIS</a>
+    <div class="result-actions">
+        <a href="/" class="btn-new-analysis">&larr; NEW ANALYSIS</a>
     </div>
 
     <article class="report-sheet">
@@ -197,13 +192,15 @@
             {% if result.served %}
             <div class="served-ads-wrap">
                 <h4 class="eval-block-title">SERVED PROGRAMMATIC BREAKS (LOGGED)</h4>
-                <div class="capture-meta">
-                    {%- if result.served.channel %}twitch.tv/{{ result.served.channel }} &middot; {% endif -%}
-                    {{ result.served.source or '' }}
-                    {%- if result.served.strategy %} &middot; {{ result.served.strategy }} watch{% endif -%}
-                    {%- if result.served.watched_seconds %} &middot; {{ result.served.watched_seconds|round|int }}s watched{% endif -%}
-                    {%- if result.served.polls %} &middot; {{ result.served.polls }} playlist polls{% endif %}
-                </div>
+                {% set _meta_bits = [] %}
+                {% if result.served.channel %}{% set _ = _meta_bits.append('twitch.tv/' ~ result.served.channel) %}{% endif %}
+                {% if result.served.source %}{% set _ = _meta_bits.append(result.served.source) %}{% endif %}
+                {% if result.served.strategy %}{% set _ = _meta_bits.append(result.served.strategy ~ ' watch') %}{% endif %}
+                {% if result.served.watched_seconds %}{% set _ = _meta_bits.append(result.served.watched_seconds|round|int ~ 's watched') %}{% endif %}
+                {% if result.served.polls %}{% set _ = _meta_bits.append(result.served.polls ~ ' playlist polls') %}{% endif %}
+                {% if _meta_bits %}
+                <div class="capture-meta">{{ _meta_bits|join(' · ') }}</div>
+                {% endif %}
                 {% if result.served.note %}<p class="report-note">{{ result.served.note }}</p>{% endif %}
                 {% if result.served.creative_count %}
                     <div class="capture-meta">
@@ -216,7 +213,7 @@
 
                 {% for a in result.served.ads %}
                 <div class="served-ad-row">
-                    <span class="ad-badge">AD {{ '%02d'|format(a.ordinal or a.ad_index or loop.index) }}</span>
+                    <span class="ad-badge">AD {{ '%02d'|format(a._ui.ordinal if a._ui else (a.ordinal or loop.index)) }}</span>
                     <div class="ad-info-main">
                         <strong>{{ a.advertiser or ('Twitch house slate' if a.house_ad else 'Unknown advertiser') }}</strong>
                         {% if a.destination %}<div class="ad-meta-text">&rarr; {{ a.destination }}</div>{% endif %}
@@ -252,18 +249,16 @@
                         {% endif %}
                     </div>
                     <div class="ad-actions-cell">
-                        {% if a.thumb_url %}
-                            <a href="{{ a.thumb_url }}"><img class="thumb" src="{{ a.thumb_url }}" alt="decoded ad frame"></a>
+                        {% set _ui = a._ui or {} %}
+                        {% if _ui.thumb_url %}
+                            <a href="{{ _ui.thumb_url }}"><img class="thumb" src="{{ _ui.thumb_url }}" alt="decoded ad frame"></a>
                         {% else %}
-                            <div class="hatched-thumb">{{ a.frame_start or a.thumbnail or 'NO FRAME CAPTURED' }}</div>
+                            <div class="hatched-thumb">NO FRAME CAPTURED</div>
                         {% endif %}
                         <div class="proof-links">
-                            {% if a.clip %}<a href="{{ a.clip_url or a.clip }}">PROOF CLIP</a>{% endif %}
-                            {% for f in a.frame_urls or [] %}<a href="{{ f.url }}">{{ f.label }}</a>{% endfor %}
+                            {% if a.clip %}<a href="{{ _ui.clip_url or a.clip }}">PROOF CLIP</a>{% endif %}
+                            {% for f in _ui.frame_urls or [] %}<a href="{{ f.url }}">{{ f.label }}</a>{% endfor %}
                         </div>
-                        {% if a.frame_paths %}
-                            <div class="frame-code">{% for p in a.frame_paths %}<code>{{ p }}</code>{% endfor %}</div>
-                        {% endif %}
                     </div>
                 </div>
                 {% endfor %}
@@ -322,12 +317,9 @@
 
             <div class="field-group">
                 <label for="link" class="field-label">Media Source Link [YouTube / Twitch]</label>
-                <div class="link-row">
-                    <input type="text" id="link" name="link" class="input-box"
-                           placeholder="Paste a YouTube or Twitch link" aria-describedby="mediaLinkHint">
-                    <button type="submit" class="link-run" aria-label="Analyze this link now">RUN &crarr;</button>
-                </div>
-                <div id="mediaLinkHint" class="control-description">Accepts live broadcasts, VODs, premiere streams, and direct media manifests. Enter also submits.</div>
+                <input type="text" id="link" name="link" class="input-box"
+                       placeholder="Paste a YouTube or Twitch link" aria-describedby="mediaLinkHint">
+                <div id="mediaLinkHint" class="control-description">Accepts live broadcasts, VODs, premiere streams, and direct media manifests. Pressing Enter here starts the analysis.</div>
             </div>
 
             <div class="or-divider" aria-hidden="true"><span>OR</span></div>
@@ -400,7 +392,10 @@
                 <li class="history-row{% if h.state == 'error' %} history-error{% endif %}">
                     <a class="history-link" href="/logs/{{ h.id }}">
                         <span class="history-time">{{ h.time }}</span>
-                        <span class="history-title">{{ h.title }}</span>
+                        <span class="history-body">
+                            <span class="history-title">{{ h.title }}</span>
+                            {% if h.snippet %}<span class="history-snippet">{{ h.snippet }}</span>{% endif %}
+                        </span>
                     </a>
                     <span class="history-meta">
                         {{ h.platform }}{% if h.model %} &middot; {{ h.model }}{% endif %}
@@ -481,22 +476,27 @@
         if (el) { el.textContent = text; }
     }
 
-    function enterLoadingMode() {
-        const btn = document.getElementById('analyzeBtn');
-        if (!btn || btn.classList.contains('loading-mode')) { return; }
-        btn.classList.add('loading-mode');
-        btn.innerHTML =
+    let activeBtn = null;
+    let activeBtnHTML = null;
+
+    function enterLoadingMode(btn) {
+        activeBtn = btn || document.getElementById('analyzeBtn');
+        if (!activeBtn || activeBtn.classList.contains('loading-mode')) { return; }
+        activeBtnHTML = activeBtn.innerHTML;
+        activeBtn.classList.add('loading-mode');
+        activeBtn.innerHTML =
             '<span class="loading-status-text"><span class="rec-dot"></span>' +
             '<span id="stepLabel">WAKING THE PIPELINE</span></span>' +
             '<div class="loading-stepped-bar"><div id="stepFill" class="loading-step-fill" style="width:8%"></div></div>';
     }
 
     function exitLoadingMode(message) {
-        const btn = document.getElementById('analyzeBtn');
         if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
-        if (btn) {
-            btn.classList.remove('loading-mode');
-            btn.innerHTML = '<span id="btnText">ANALYZE MEDIA &amp; ADS</span>';
+        if (activeBtn) {
+            activeBtn.classList.remove('loading-mode');
+            if (activeBtnHTML) { activeBtn.innerHTML = activeBtnHTML; }
+            activeBtn = null;
+            activeBtnHTML = null;
         }
         setAnalyzeStatus(message);
     }
@@ -543,9 +543,8 @@
     if (analyzerForm) {
         analyzerForm.addEventListener('submit', function (e) {
             e.preventDefault();
-            const btn = document.getElementById('analyzeBtn');
-            if (!btn || btn.classList.contains('loading-mode')) { return; }
-            enterLoadingMode();
+            if (activeBtn && activeBtn.classList.contains('loading-mode')) { return; }
+            enterLoadingMode(e.submitter);
             setAnalyzeStatus('queuing the job…');
 
             const payload = new FormData(analyzerForm);

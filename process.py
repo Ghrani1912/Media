@@ -95,6 +95,14 @@ def _is_ad_like_text(text: str) -> bool:
 # music/noisy audio; "small" is a much better default. Override with WHISPER_MODEL.
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "small")
 
+# Decoder strategy. Greedy (1) is 2-3x faster than beam search for a marginal
+# accuracy cost; set WHISPER_BEAM_SIZE=5 for the old behavior.
+WHISPER_BEAM_SIZE_DEFAULT = int(os.environ.get("WHISPER_BEAM_SIZE", "1") or 1)
+# fp16 only helps on CUDA; WHISPER_FP16=1 enables it there.
+WHISPER_FP16_DEFAULT = os.environ.get("WHISPER_FP16", "").strip().lower() in {
+    "1", "true", "yes"
+}
+
 # Optional yt-dlp authentication, needed when YouTube asks to "confirm you're not
 # a bot". Point YTDLP_COOKIES at an exported cookies.txt, or set
 # YTDLP_COOKIES_FROM_BROWSER=chrome/firefox/edge to read cookies from a browser.
@@ -162,8 +170,10 @@ def _enrich_served_ads(served_report: dict | None) -> None:
         return
     base = served_report.get("proof_dir") or ""
     for i, ad in enumerate(served_report.get("ads") or [], start=1):
+        # Display order, not the pod index: two spots of one pod would
+        # otherwise both badge as "AD 02".
         ui: dict = {
-            "ordinal": ad.get("ordinal") or ad.get("ad_index") or i,
+            "ordinal": ad.get("ordinal") or i,
         }
 
         def _url(value: str | None) -> str | None:
@@ -172,7 +182,10 @@ def _enrich_served_ads(served_report: dict | None) -> None:
             if base and value.startswith(base):
                 tail = value[len(base):].lstrip("\\/").replace("\\", "/")
                 return f"/proof/{tail}"
-            return None
+            # Unknown prefix: the /proof route serves by basename within the
+            # default proof dir, which is where captures write anyway.
+            tail = value.replace("\\", "/").rsplit("/", 1)[-1]
+            return f"/proof/{tail}"
 
         frames = []
         for key, label in (("frame_start", "FRAME START"), ("frame_mid", "FRAME MID"),
@@ -420,9 +433,24 @@ def transcribe(audio_path: str, model_name: str | None = None,
     greedy decoder. Segments are needed for transcript-based ad detection.
     """
     model = _get_model(model_name)
-    result = model.transcribe(
-        audio_path, fp16=False, beam_size=5, language=language
-    )
+    use_fp16 = WHISPER_FP16_DEFAULT
+    beam_size = WHISPER_BEAM_SIZE_DEFAULT
+    try:
+        result = model.transcribe(
+            audio_path, fp16=use_fp16, beam_size=beam_size, language=language
+        )
+    except RuntimeError as exc:
+        # Very short or unusual audio trips a known Whisper bug in beam search
+        # ("Sizes of tensors must match ... Expected size 5 but got size 1").
+        # Greedy decoding has no such constraint, so retry with it instead of
+        # failing the whole analysis.
+        if "Sizes of tensors must match" not in str(exc):
+            raise
+        logger.warning("Whisper beam search failed on %s (%s); retrying greedy.",
+                       audio_path, str(exc)[:120])
+        result = model.transcribe(
+            audio_path, fp16=use_fp16, beam_size=1, language=language
+        )
     segments = [
         {
             "start": float(s.get("start", 0.0)),
@@ -611,6 +639,35 @@ def process_video(link: str | None = None, file_path: str | None = None,
     if audio_path != video_path:
         temp_files.append(audio_path)
 
+    # Served-ad capture only needs the link, so start it in parallel with the
+    # (much slower) transcription instead of after it. On a 27-minute video
+    # this hides the whole sweep inside the Whisper pass.
+    capture_thread = None
+    capture_box: dict = {}
+    if capture_served and link:
+        report_stage(job_id, "ads",
+                     "watching for served ads in parallel with transcription on "
+                     + ("twitch.tv" if platform == "Twitch" else "youtube"))
+
+        def _capture():
+            try:
+                capture_box["report"] = served_ads.capture_served_ads(
+                    link,
+                    watch_seconds=served_watch_seconds,
+                    proof_dir=proof_dir,
+                    video_id=ads.extract_video_id(link),
+                )
+            except Exception as exc:  # capture must never break the pipeline
+                logger.warning("Served-ad capture failed: %s", exc)
+                capture_box["report"] = {
+                    "available": False, "captured": False, "ads": [], "ad_count": 0,
+                    "ad_seconds": 0.0, "note": f"Served-ad capture failed: {exc}",
+                }
+
+        capture_thread = threading.Thread(target=_capture, name="served-capture",
+                                          daemon=True)
+        capture_thread.start()
+
     report_stage(job_id, "transcribe",
                  f"whisper {model_name or WHISPER_MODEL} on "
                  f"{os.path.basename(audio_path)}")
@@ -619,23 +676,9 @@ def process_video(link: str | None = None, file_path: str | None = None,
     sentiment, keywords = analyze_text(transcript)
 
     served_report: dict | None = None
-    if capture_served and link:
-        report_stage(job_id, "ads",
-                     "watching for served ads on "
-                     + ("twitch.tv" if platform == "Twitch" else "youtube"))
-        try:
-            served_report = served_ads.capture_served_ads(
-                link,
-                watch_seconds=served_watch_seconds,
-                proof_dir=proof_dir,
-                video_id=ads.extract_video_id(link),
-            )
-        except Exception as exc:  # capture must never break the pipeline
-            logger.warning("Served-ad capture failed: %s", exc)
-            served_report = {
-                "available": False, "captured": False, "ads": [], "ad_count": 0,
-                "ad_seconds": 0.0, "note": f"Served-ad capture failed: {exc}",
-            }
+    if capture_thread is not None:
+        capture_thread.join()  # usually already finished inside the Whisper pass
+        served_report = capture_box.get("report")
 
     report_stage(job_id, "ads", "scanning transcript for sponsor reads")
     try:

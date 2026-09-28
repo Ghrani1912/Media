@@ -325,6 +325,7 @@ def _record_history(job_id: str, state: str, html: str, summary: dict) -> None:
 
         ads_report = summary.get("ads") or {}
         served_report = summary.get("served") or {}
+        transcript = (summary.get("transcript") or "").strip()
         entry = {
             "id": job_id,
             "state": state,
@@ -336,6 +337,8 @@ def _record_history(job_id: str, state: str, html: str, summary: dict) -> None:
             "sentiment": round(float(summary.get("sentiment") or 0.0), 3),
             "ads": (ads_report.get("ad_count") or 0),
             "served": (served_report.get("ad_count") or 0),
+            # first words of the transcript, so a row is recognisable at a glance
+            "snippet": transcript[:140] + ("…" if len(transcript) > 140 else ""),
         }
         with _HISTORY_LOCK:  # concurrent workers share the index read-modify-write
             entries = [e for e in _history_load() if e.get("id") != job_id]

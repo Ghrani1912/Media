@@ -191,6 +191,36 @@ def test_transcribe_returns_segments(monkeypatch, audio_file):
     assert result["segments"] == [{"start": 0.0, "end": 2.0, "text": "hi"}]
 
 
+def test_transcribe_retries_greedy_when_beam_search_blows_up(monkeypatch, audio_file):
+    """The known Whisper beam-search tensor bug must not kill the analysis."""
+    calls = []
+    monkeypatch.setattr(process, "WHISPER_BEAM_SIZE_DEFAULT", 5)
+    monkeypatch.setattr(process, "WHISPER_FP16_DEFAULT", False)
+
+    class _FlakyModel:
+        def transcribe(self, path, **kwargs):
+            calls.append(kwargs.get("beam_size"))
+            if kwargs.get("beam_size") == 5:
+                raise RuntimeError("Sizes of tensors must match except in dimension 1. "
+                                   "Expected size 5 but got size 1 for tensor number 1 in the list.")
+            return {"text": " recovered", "segments": [], "language": "en"}
+
+    monkeypatch.setattr(process, "_get_model", lambda name=None: _FlakyModel())
+    result = process.transcribe(audio_file)
+    assert result["text"] == "recovered"
+    assert calls == [5, 1]  # beam first, then the greedy retry
+
+
+def test_transcribe_reraises_other_runtime_errors(monkeypatch, audio_file):
+    class _BrokenModel:
+        def transcribe(self, path, **kwargs):
+            raise RuntimeError("CUDA out of memory")
+
+    monkeypatch.setattr(process, "_get_model", lambda name=None: _BrokenModel())
+    with pytest.raises(RuntimeError, match="CUDA out of memory"):
+        process.transcribe(audio_file)
+
+
 def test_process_video_includes_ad_report(monkeypatch, audio_file, tmp_path):
     model = _FakeModel(segments=[
         {"start": 5.0, "end": 30.0, "text": "This video is sponsored by Acme."}
@@ -622,8 +652,11 @@ def test_post_renders_a_twitch_capture(monkeypatch, client):
 # be missing from the old UI (they were xfails until the Broadcast Log sheet).
 def _post_twitch(monkeypatch, client, report=None):
     import main
+    import process as process_module
 
     served = report or _twitch_served_report()
+    # the real pipeline runs this enrichment before rendering; mirror it
+    process_module._enrich_served_ads(served)
     monkeypatch.setattr(
         main, "process_video",
         lambda **kwargs: {

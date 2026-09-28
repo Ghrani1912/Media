@@ -438,37 +438,8 @@ body {
     transition: width 300ms linear;
 }
 
-/* Collapsed strip */
-.collapsed-strip {
-    background: var(--color-ink);
-    color: var(--color-white);
-    padding: 12px 18px;
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    border: var(--border-thick);
-    margin-bottom: 32px;
-    flex-wrap: wrap;
-    gap: 8px;
-}
-
-.collapsed-source {
-    font-family: var(--font-mono);
-    font-size: 13px;
-    display: flex;
-    align-items: center;
-    gap: 14px;
-    color: #E2DDD3;
-    flex-wrap: wrap;
-}
-
-.collapsed-source strong {
-    color: var(--color-yellow);
-    text-transform: uppercase;
-    font-family: var(--font-display);
-    font-size: 16px;
-    letter-spacing: 0.05em;
-}
+/* Result actions row */
+.result-actions { margin-bottom: 16px; }
 
 .btn-new-analysis {
     background: var(--color-red);
@@ -1019,9 +990,26 @@ body {
     text-decoration: none;
     color: var(--color-ink);
     min-width: 0;
+    flex: 1;
 }
 
 .history-link:hover .history-title { background: var(--color-yellow); }
+
+.history-body {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+}
+
+.history-snippet {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--color-grey);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 60ch;
+}
 
 .history-time {
     font-family: var(--font-mono);

@@ -352,6 +352,25 @@ def _slug(value: str | None, fallback: str = "ad") -> str:
     return text[:40] or fallback
 
 
+def probe_title(url: str) -> str | None:
+    """Best-effort video title via yt-dlp metadata, without downloading.
+
+    Uses flat extraction (no format resolution), so it is one quick network
+    round trip. Returns None when the title cannot be had — callers fall back
+    to :func:`fallback_title`.
+    """
+    try:
+        import yt_dlp
+
+        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True,
+                               "skip_download": True, "extract_flat": True}) as ydl:
+            info = ydl.extract_info(url, download=False)
+        title = (info or {}).get("title")
+        return str(title).strip() or None
+    except Exception:
+        return None
+
+
 def fallback_title(url: str) -> str:
     """Short human label for a link when no video title can be probed.
 
@@ -1337,14 +1356,23 @@ def _write_index(recorder, url: str, ads) -> str | None:
     return path
 
 
-def format_timeline(ad: dict) -> str:
-    """Human-readable position of an ad on the video timeline and wall clock.
+def format_timeline(ad) -> str:
+    """Human-readable position on the video timeline.
 
-    Hours appear only when there are any, which keeps short videos reading as
-    ``5:12`` while still describing a long Twitch broadcast honestly.
+    Accepts either an ad dict (reads ``content_position``) or a raw number of
+    seconds, so the report timeline can reuse the same clock formatting. Hours
+    appear only when there are any, which keeps short videos reading as ``5:12``
+    while still describing a long Twitch broadcast honestly.
     """
-    position = ad.get("content_position")
+    if isinstance(ad, dict):
+        position = ad.get("content_position")
+    else:
+        position = ad
     if position is None:
+        return ""
+    try:
+        position = float(position)
+    except (TypeError, ValueError):
         return ""
     hours, rest = divmod(int(position), 3600)
     minutes, seconds = divmod(rest, 60)
