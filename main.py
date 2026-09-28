@@ -7,16 +7,17 @@ the pipeline in ``process.py``, and reports the result.
 from __future__ import annotations
 
 import logging
-import mimetypes
 import os
+import re
+import threading
+import time
 import uuid
 
-from flask import Flask, abort, render_template, request, send_from_directory
+from flask import Flask, jsonify, render_template, request, send_from_directory
 from werkzeug.utils import secure_filename
 
 import served_ads
-
-from process import REPORT_PATH, WHISPER_MODEL, process_video
+from process import REPORT_PATH, WHISPER_MODEL, pop_stage, process_video
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_FOLDER = os.path.join(BASE_DIR, "uploads")
@@ -38,7 +39,7 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 MODEL_NOTES = {
     "tiny": "lowest resource, fastest turnaround",
     "base": "small and quick, rougher on noisy audio",
-    "small": "balanced accuracy (default)",
+    "small": "balanced accuracy",
     "medium": "more accurate, slower",
     "large": "most accurate, slowest deep pass",
 }
@@ -48,7 +49,8 @@ def _display_title(link: str | None, file_path: str | None) -> str:
     """Human title for the report header: video title when it can be probed,
     otherwise the file/URL's own name."""
     if file_path:
-        return os.path.basename(file_path)
+        # strip the uuid prefix /analyze adds for collision-free storage
+        return re.sub(r"^[0-9a-f]{8}_", "", os.path.basename(file_path))
     if link:
         try:
             info = served_ads.probe_title(link)
@@ -77,7 +79,11 @@ def inject_form_defaults():
         "selected_model": WHISPER_MODEL,
         "default_model": WHISPER_MODEL,
         "model_notes": MODEL_NOTES,
-        "max_upload_mb": MAX_CONTENT_LENGTH // (1024 * 1024),
+        "max_upload_label": (
+            f"{MAX_CONTENT_LENGTH // (1024 * 1024 * 1024)} GB"
+            if MAX_CONTENT_LENGTH % (1024 * 1024 * 1024) == 0
+            else f"{MAX_CONTENT_LENGTH // (1024 * 1024)} MB"
+        ),
     }
 
 
@@ -107,6 +113,12 @@ def tc_filter(seconds) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
 
+@app.template_filter("basename")
+def basename_filter(path) -> str:
+    """Final path segment, slash- and backslash-tolerant."""
+    return str(path or "").replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+
+
 # The capture readers write proof clips, decoded frames and manifests under
 # proof/; this route lets the report sheet link to them without making the
 # whole uploads tree public.
@@ -132,9 +144,132 @@ def mime_probe(guess: str):
     return {"guessed": mimetypes.guess_type(guess)[0]}
 
 
-@app.route("/_abort")
-def _abort_probe():  # pragma: no cover - defensive helper
-    abort(400)
+# --------------------------------------------------------------------------- #
+# Job model: the browser posts the form as JSON, gets a job id back immediately,
+# and polls /status/<id> while a worker thread runs the real pipeline. The
+# pipeline announces its stages (fetch/transcribe/ads) via report_stage, so the
+# ANALYZE button shows where the work actually is instead of timed guesses.
+# --------------------------------------------------------------------------- #
+_JOBS: dict[str, dict] = {}
+_JOBS_LOCK = threading.Lock()
+_JOB_TTL = 1800.0  # seconds a finished job stays fetchable
+
+_STAGE_LABELS = {
+    "fetch": ("01/03 FETCHING AUDIO", 33.3),
+    "transcribe": ("02/03 TRANSCRIBING", 66.6),
+    "ads": ("03/03 READING ADS", 100.0),
+}
+
+
+def _prune_jobs() -> None:
+    cutoff = time.time() - _JOB_TTL
+    with _JOBS_LOCK:
+        for job_id in [j for j, v in _JOBS.items()
+                       if v.get("finished_at", 0) and v["finished_at"] < cutoff]:
+            _JOBS.pop(job_id, None)
+
+
+def _run_job(job_id: str, **kwargs) -> None:
+    """Worker: run the pipeline, record the outcome, keep the page's data."""
+    file_path = kwargs.get("file_path")
+    try:
+        with app.app_context():  # render_template needs a context; threads don't get one
+            result = process_video(job_id=job_id, **kwargs)
+            result["title"] = _display_title(kwargs.get("link"), file_path)
+            html = render_template(
+                "index.html", result=result,
+                selected_model=kwargs.get("model_name") or WHISPER_MODEL)
+            with _JOBS_LOCK:
+                _JOBS[job_id].update(state="done", html=html,
+                                     finished_at=time.time())
+    except Exception as exc:  # the page must show the reason, not spin forever
+        logger.exception("Job %s failed", job_id)
+        with app.app_context():
+            html = render_template("index.html", error=f"Processing failed: {exc}")
+        with _JOBS_LOCK:
+            _JOBS[job_id].update(state="error", html=html, error=str(exc),
+                                 finished_at=time.time())
+    finally:
+        # Uploads are transient: the old synchronous path removed them in a
+        # finally, and the worker must too.
+        if file_path:
+            try:
+                os.remove(file_path)
+            except OSError:
+                pass
+
+
+def _pop_unseen_stage(job_id: str) -> dict | None:
+    """Latest un-polled stage announcement, if any."""
+    return pop_stage(job_id)
+
+
+@app.post("/analyze")
+def analyze():
+    """Accept the form (JSON or multipart), start a job, return its id."""
+    _prune_jobs()
+    payload = request.get_json(silent=True) or {}
+
+    link = (payload.get("link") or request.form.get("link") or "").strip()
+    model = (payload.get("model") or request.form.get("model") or "").strip()
+    capture_served = bool(payload.get("capture_served")
+                          or request.form.get("capture_served"))
+    file = request.files.get("file")
+
+    if not link and not (file and file.filename):
+        return jsonify({"error": "Provide a YouTube/Twitch link or upload a file."}), 400
+    if link and file and file.filename:
+        return jsonify({"error": "Provide a link or a file, not both."}), 400
+    if file and file.filename and not allowed_file(file.filename):
+        return jsonify({"error": "Unsupported file type. Allowed: "
+                        + ", ".join(sorted(ALLOWED_EXTENSIONS))}), 400
+    if model not in ALLOWED_MODELS:
+        model = None  # fall back to the configured default
+
+    job_id = uuid.uuid4().hex
+    file_path = None
+    if file and file.filename:
+        file_path = _unique_path(file.filename)
+        file.save(file_path)
+
+    with _JOBS_LOCK:
+        _JOBS[job_id] = {
+            "state": "running", "created_at": time.time(),
+            "finished_at": None, "html": None, "error": None,
+        }
+
+    kwargs = {"model_name": model, "capture_served": capture_served}
+    if link:
+        kwargs["link"] = link
+    else:
+        kwargs["file_path"] = file_path
+    worker = threading.Thread(target=_run_job, args=(job_id,), kwargs=kwargs,
+                              name=f"analyze-{job_id[:8]}", daemon=True)
+    worker.start()
+    return jsonify({"job": job_id})
+
+
+@app.get("/status/<job_id>")
+def job_status(job_id: str):
+    """Poll a job: pipeline stage while running, the rendered page when done."""
+    with _JOBS_LOCK:
+        job = _JOBS.get(job_id)
+        if job is None:
+            return jsonify({"error": "unknown job"}), 404
+        state = job["state"]
+        error = job["error"]
+        html = job["html"]
+
+    if state == "done":
+        return jsonify({"state": "done", "html": html})
+    if state == "error":
+        return jsonify({"state": "error", "error": error, "html": html})
+
+    stage_info = _pop_unseen_stage(job_id)
+    stage = (stage_info or {}).get("stage") or "fetch"
+    label, pct = _STAGE_LABELS.get(stage, ("01/03 FETCHING AUDIO", 33.3))
+    return jsonify({"state": "running", "stage": stage, "label": label,
+                    "percent": pct, "detail": (stage_info or {}).get("detail", "")})
 
 
 def _unique_path(filename: str) -> str:
@@ -190,6 +325,7 @@ def index():
         return render_template("index.html", error=f"Processing failed: {exc}"), 500
 
     result["title"] = _display_title(link, uploaded_path)
+    # Rendered server-side for non-JS clients; the browser JS uses /analyze.
     return render_template("index.html", result=result,
                            selected_model=model or WHISPER_MODEL)
 
@@ -212,4 +348,9 @@ def health():
 
 
 if __name__ == "__main__":
-    app.run(debug=True, host="127.0.0.1", port=5000)
+    # The default watchdog reloader restarts on ANY file event under the cwd,
+    # including yt-dlp cache writes inside ./mediaenv311 -- that would wipe the
+    # in-memory job table mid-analysis. The plain stat reloader only watches
+    # imported .py files, so long jobs survive package churn.
+    app.run(debug=True, use_reloader=True, reloader_type="stat",
+            host="127.0.0.1", port=5000)

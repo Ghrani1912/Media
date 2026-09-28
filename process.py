@@ -120,9 +120,14 @@ def report_stage(job_id: str | None, stage: str, detail: str = "") -> None:
     """Publish the current pipeline stage for ``job_id`` (no-op without one)."""
     if not job_id:
         return
+    now = time.time()
     with _STAGE_LOCK:
+        # Prune entries nobody polled for (closed tab, non-JS client).
+        for stale in [k for k, v in _JOB_STAGES.items()
+                      if now - v.get("updated", 0) > 3600]:
+            _JOB_STAGES.pop(stale, None)
         _JOB_STAGES[job_id] = {"stage": stage, "detail": detail,
-                               "updated": time.time()}
+                               "updated": now}
 
 
 def pop_stage(job_id: str) -> dict | None:

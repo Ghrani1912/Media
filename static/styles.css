@@ -983,6 +983,15 @@ body {
 
 .report-footer span { color: var(--color-ink); font-weight: 600; word-break: break-all; }
 
+.report-footer a.report-link {
+    color: var(--color-ink);
+    font-weight: 600;
+    text-decoration: underline;
+    word-break: break-all;
+}
+
+.report-footer a.report-link:hover { background: var(--color-yellow); }
+
 @media (prefers-reduced-motion: reduce) {
     * { transition: none !important; animation: none !important; }
 }

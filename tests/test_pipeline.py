@@ -5,6 +5,7 @@ Whisper and yt-dlp are mocked so the suite runs fast and offline.
 
 import io
 import os
+import threading
 
 import pytest
 
@@ -676,3 +677,158 @@ def test_post_twitch_proof_images_are_served_over_http(monkeypatch, client, tmp_
     assert r.status_code == 200
     assert r.data == b"fake-png"
     assert client.get("/proof/../main.py").status_code in (403, 404)
+
+
+# --------------------------------------------------------------------------- #
+# The /analyze + /status job model: the page polls real pipeline stages
+# --------------------------------------------------------------------------- #
+def _wait_for_job(client, job_id, timeout=15.0):
+    import time
+
+    deadline = time.time() + timeout
+    last = {}
+    while time.time() < deadline:
+        r = client.get(f"/status/{job_id}")
+        assert r.status_code == 200
+        last = r.get_json()
+        if last["state"] in {"done", "error"}:
+            return last
+        time.sleep(0.05)
+    return last
+
+
+def test_analyze_job_runs_to_done_and_reports_stages(monkeypatch, client):
+    import main
+    import process as process_module
+
+    def _fake_process(**kwargs):
+        # a real pipeline would announce these; mimic it
+        process_module.report_stage(kwargs["job_id"], "fetch", "downloading")
+        process_module.report_stage(kwargs["job_id"], "transcribe", "whisper")
+        process_module.report_stage(kwargs["job_id"], "ads", "reading markers")
+        return {
+            "platform": "YouTube", "target": "http://x", "title": "t",
+            "transcript": "hello from the job", "sentiment": 0.2,
+            "keywords": ["k"], "report": "r.xlsx", "model": "small",
+            "ads": {"ad_count": 0, "ad_seconds": 0, "segments": [],
+                    "note": ""},
+            "served": {"ad_count": 0, "ads": [], "note": ""},
+        }
+
+    monkeypatch.setattr(main, "process_video", _fake_process)
+    r = client.post("/analyze", data={"link": "http://x"})
+    assert r.status_code == 200
+    job_id = r.get_json()["job"]
+
+    # while it runs, the poller exposes the announced stage; afterwards, done
+    running = client.get(f"/status/{job_id}").get_json()
+    if running["state"] == "running":
+        assert running["label"] in {"01/03 FETCHING AUDIO", "02/03 TRANSCRIBING",
+                                    "03/03 READING ADS"}
+
+    final = _wait_for_job(client, job_id)
+    assert final["state"] == "done"
+    assert "hello from the job" in final["html"]
+
+
+def test_analyze_running_status_reports_stage_labels(monkeypatch, client):
+    import main
+    import process as process_module
+
+    release = threading.Event()
+
+    def _slow_process(**kwargs):
+        release.wait(10)
+        return {"platform": "YouTube", "target": "x", "title": "t",
+                "transcript": "t", "sentiment": 0.0, "keywords": [],
+                "report": "r.xlsx", "model": "small",
+                "ads": {"ad_count": 0, "ad_seconds": 0, "segments": [], "note": ""},
+                "served": {"ad_count": 0, "ads": [], "note": ""}}
+
+    monkeypatch.setattr(main, "process_video", _slow_process)
+    job_id = client.post("/analyze", data={"link": "http://x"}).get_json()["job"]
+
+    process_module.report_stage(job_id, "transcribe", "whisper small on clip.mp3")
+    r = client.get(f"/status/{job_id}").get_json()
+    assert r["state"] == "running"
+    assert r["label"] == "02/03 TRANSCRIBING"
+    assert r["percent"] == 66.6
+    assert r["detail"] == "whisper small on clip.mp3"
+
+    release.set()
+    final = _wait_for_job(client, job_id)
+    assert final["state"] == "done"
+
+
+def test_analyze_job_error_surfaces_reason(monkeypatch, client):
+    import main
+
+    def _boom(**kwargs):
+        raise RuntimeError("yt-dlp exploded")
+
+    monkeypatch.setattr(main, "process_video", _boom)
+    job_id = client.post("/analyze", data={"link": "http://x"}).get_json()["job"]
+    final = _wait_for_job(client, job_id)
+    assert final["state"] == "error"
+    assert "yt-dlp exploded" in final["error"]
+    assert "Processing failed" in final["html"]
+
+
+def test_analyze_rejects_bad_input(client):
+    assert client.post("/analyze", data={}).status_code == 400
+    assert client.post("/analyze", data={"link": "x", "model": "godzilla"}
+                      ).status_code == 200  # model falls back silently
+
+
+def test_status_unknown_job_404s(client):
+    assert client.get("/status/nope").status_code == 404
+
+
+def test_report_footer_links_the_workbook(monkeypatch, client):
+    import main
+
+    monkey_result = {
+        "platform": "YouTube", "target": "x", "title": "t",
+        "transcript": "t", "sentiment": 0.0, "keywords": [],
+        "report": str(main.REPORT_PATH), "model": "small",
+        "ads": {"ad_count": 0, "ad_seconds": 0, "segments": [], "note": ""},
+        "served": {"ad_count": 0, "ads": [], "note": ""},
+    }
+    monkeypatch.setattr(main, "process_video", lambda **kw: monkey_result)
+    body = client.post("/", data={"link": "http://x"}).data.decode()
+    name = main.basename_filter(main.REPORT_PATH)
+    assert f'href="/downloads/{name}"' in body
+    assert "REPORT SAVED TO" in body
+
+
+def test_basename_filter_handles_windows_paths():
+    import main
+
+    assert main.basename_filter(r"C:\Users\91966\Media\media_report.xlsx") \
+        == "media_report.xlsx"
+    assert main.basename_filter("a/b/c.xlsx") == "c.xlsx"
+    assert main.basename_filter(None) == ""
+
+
+def test_uploaded_file_removed_after_async_job(client, tmp_path, monkeypatch):
+    import main
+
+    monkeypatch.setitem(main.app.config, "UPLOAD_FOLDER", str(tmp_path))
+    done = threading.Event()
+
+    def _fake_process(**kwargs):
+        done.set()
+        return {"platform": "Uploaded File", "target": "x", "title": "t",
+                "transcript": "t", "sentiment": 0.0, "keywords": [],
+                "report": "r.xlsx", "model": "small",
+                "ads": {"ad_count": 0, "ad_seconds": 0, "segments": [], "note": ""},
+                "served": {"ad_count": 0, "ads": [], "note": ""}}
+
+    monkeypatch.setattr(main, "process_video", _fake_process)
+    job_id = client.post(
+        "/analyze",
+        data={"file": (io.BytesIO(b"abc"), "clip.mp3")},
+        content_type="multipart/form-data",
+    ).get_json()["job"]
+    assert _wait_for_job(client, job_id)["state"] == "done"
+    assert os.listdir(str(tmp_path)) == []  # upload cleaned up by the worker
