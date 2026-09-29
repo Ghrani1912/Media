@@ -43,5 +43,9 @@ yt-dlp>=2026.8.19
 openai-whisper>=20240930
 numpy<2.2
 textblob>=0.18
+
+# Sentiment runs a small transformer (GPU when available) and only falls back
+# to TextBlob when the model can't be downloaded. First run fetches ~500 MB.
+transformers>=4.44
 openpyxl>=3.1
 selenium>=4.20

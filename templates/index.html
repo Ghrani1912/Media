@@ -46,7 +46,7 @@
             <div class="report-meta-line">
                 <div>MODEL: <span>{{ result.model }}{% if result.device %} · {{ result.device|upper }}{% endif %}</span></div>
                 <div>LANGUAGE: <span>{{ (result.language or '—')|upper }}</span></div>
-                <div>ANALYSIS: <span>WHISPER + TEXTBLOB</span></div>
+                <div>ANALYSIS: <span>WHISPER + ROBERTA SENTIMENT</span></div>
             </div>
         </header>
 

@@ -30,6 +30,42 @@ from textblob import TextBlob
 import ads
 import served_ads
 
+# Sentiment: a small transformer beats TextBlob's lexicon on casual speech and
+# gaming slang (its training domain is tweets). TextBlob stays as the fallback
+# when transformers/model download is unavailable. SENTIMENT_MODEL=off -> TextBlob.
+SENTIMENT_MODEL_DEFAULT = "cardiffnlp/twitter-roberta-base-sentiment-latest"
+SENTIMENT_MAX_CHARS = 256 * 4  # chunk transcripts longer than the model window
+
+_sentiment_pipeline = None
+_sentiment_pipeline_attempted = False
+
+
+def _get_sentiment_pipeline():
+    """Load the transformer sentiment model once (GPU when available)."""
+    global _sentiment_pipeline, _sentiment_pipeline_attempted
+    if _sentiment_pipeline_attempted:
+        return _sentiment_pipeline
+    _sentiment_pipeline_attempted = True
+    name = os.environ.get("SENTIMENT_MODEL", SENTIMENT_MODEL_DEFAULT).strip()
+    if not name or name.lower() == "off":
+        return None
+    try:
+        from transformers import pipeline as hf_pipeline
+
+        device = _resolve_device()
+        _sentiment_pipeline = hf_pipeline(
+            "sentiment-analysis", model=name,
+            device=0 if device == "cuda" else -1,
+            truncation=True,
+        )
+        logger.info("Sentiment model '%s' loaded on %s", name,
+                    "GPU" if device == "cuda" else "CPU")
+    except Exception as exc:
+        logger.warning("Sentiment transformer unavailable (%s); using TextBlob.",
+                       str(exc)[:140])
+        _sentiment_pipeline = None
+    return _sentiment_pipeline
+
 logger = logging.getLogger(__name__)
 
 # Directory used for intermediate downloads/extractions. Kept out of the repo.
@@ -547,19 +583,71 @@ def transcribe_audio(audio_path: str, model_name: str | None = None,
     return transcribe(audio_path, model_name=model_name, language=language)["text"]
 
 
+def _transformer_sentiment(text: str) -> float | None:
+    """Polarity in [-1, 1] from the transformer model, or None if unavailable.
+
+    Long transcripts are split into sentence-ish chunks (the model's window is
+    a few hundred characters), each scored, then combined by confidence-weighted
+    vote; the winner's score is signed by the label.
+    """
+    nlp = _get_sentiment_pipeline()
+    if nlp is None:
+        return None
+    try:
+        chunks = [c.strip() for c in text.split(".") if c.strip()]
+        if not chunks:
+            return None
+        # Pack chunks up to the model window to cut the number of passes.
+        packed: list[str] = []
+        buf = ""
+        for chunk in chunks:
+            if len(buf) + len(chunk) + 2 <= SENTIMENT_MAX_CHARS:
+                buf = f"{buf}. {chunk}" if buf else chunk
+            else:
+                if buf:
+                    packed.append(buf)
+                buf = chunk[:SENTIMENT_MAX_CHARS]
+        if buf:
+            packed.append(buf)
+
+        preds = nlp(packed)
+        score_by_label = {"positive": 1.0, "negative": -1.0, "neutral": 0.0}
+        weighted: dict[str, float] = {"positive": 0.0, "negative": 0.0, "neutral": 0.0}
+        for pred in preds:
+            label = str(pred.get("label", "neutral")).strip().lower()
+            conf = float(pred.get("score", 0.0))
+            if label.startswith("label_"):  # some checkpoints emit LABEL_0/1/2
+                label = {"label_0": "negative", "label_1": "neutral",
+                         "label_2": "positive"}.get(label, "neutral")
+            if label not in weighted:
+                continue
+            weighted[label] += conf
+        best = max(weighted, key=weighted.get)
+        return score_by_label[best] * weighted[best]
+    except Exception as exc:
+        logger.warning("Transformer sentiment failed (%s); falling back.",
+                       str(exc)[:140])
+        return None
+
+
 def analyze_text(text: str) -> tuple[float, list[str]]:
     """Return (sentiment polarity, keyword list) for ``text``.
 
-    Keyword extraction is best-effort: TextBlob's noun-phrase tagger can require
-    NLTK corpora that may not be present, so it falls back to frequency-based
+    Sentiment uses a small transformer fine-tuned on casual text (tweets),
+    which reads gaming slang and hype correctly where TextBlob's lexicon does
+    not; TextBlob remains the fallback when the model is unavailable. Keyword
+    extraction is best-effort: TextBlob's noun-phrase tagger can require NLTK
+    corpora that may not be present, so it falls back to frequency-based
     extraction rather than failing the whole pipeline.
     """
     text = text or ""
     if not text.strip():
         return 0.0, []
 
-    blob = TextBlob(text)
-    sentiment = float(blob.sentiment.polarity)
+    sentiment = _transformer_sentiment(text)
+    blob = TextBlob(text)  # still used for noun-phrase keywords
+    if sentiment is None:
+        sentiment = float(blob.sentiment.polarity)
 
     keywords: list[str] = []
     try:

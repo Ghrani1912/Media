@@ -4,7 +4,7 @@ Point it at a YouTube/Twitch link (or upload a media file) and it will:
 
 1. download the audio (`yt-dlp` + `ffmpeg`),
 2. transcribe it with OpenAI Whisper,
-3. score the sentiment and pull out keywords,
+3. score the sentiment (small transformer, GPU-accelerated) and pull out keywords,
 4. append one row to an Excel report (`media_report.xlsx`),
 5. report the ads it can honestly prove are there — see below, because "ads" here
    means three different things.
@@ -119,9 +119,17 @@ System requirements that pip cannot provide:
 * `numpy<2.2` is pinned in `requirements.txt` because `openai-whisper` pulls in
   numba, which does not work with newer NumPy.
 
-## GPU acceleration (automatic)
 
-Transcription runs on your NVIDIA GPU when one is present — measured on an RTX
+## Sentiment model
+
+Scores come from `cardiffnlp/twitter-roberta-base-sentiment-latest` — a ~500 MB
+RoBERTa fine-tuned on tweets, which reads hype and gaming slang correctly where
+TextBlob's lexicon does not (measured: "absolutely cracked play" reads +0.95
+there, −0.40 in TextBlob). It runs on the GPU when one is present and the
+download is cached after the first run. `SENTIMENT_MODEL=<hf-id>` swaps the
+checkpoint; `SENTIMENT_MODEL=off` falls back to TextBlob entirely.
+
+## GPU acceleration (automatic)Transcription runs on your NVIDIA GPU when one is present — measured on an RTX
 4050 Laptop with the `small` model over a 27-minute video: **302 s on CPU →
 120 s on GPU (2.5× faster end-to-end)**, and the GPU frees the CPU for the
 parallel ad capture. fp16 is enabled automatically on CUDA. No setup is needed
@@ -140,6 +148,7 @@ Everything is environment variables; the defaults are sane.
 | Variable | Default | Meaning |
 |---|---|---|
 | `WHISPER_MODEL` | `small` | `tiny`/`base`/`small`/`medium`/`large` |
+| `SENTIMENT_MODEL` | `cardiffnlp/twitter-roberta-base-sentiment-latest` | Any HF sentiment checkpoint; `off` = TextBlob |
 | `WHISPER_DEVICE` | `auto` | `auto` uses the GPU when torch sees CUDA (recommended); force `cpu` or `cuda` |
 | `WHISPER_FP16` | auto | fp16 math: on by default on CUDA, off on CPU; `1`/`0` forces it |
 | `WHISPER_BEAM_SIZE` | `1` | Greedy decoding; `5` = old slower beam search |
@@ -214,7 +223,7 @@ proof/
 ## Tests
 
 ```
-mediaenv311/Scripts/python.exe -m pytest -q      # 186 passed
+mediaenv311/Scripts/python.exe -m pytest -q      # 194 passed
 ```
 
 Whisper, yt-dlp, Chrome, ffmpeg and the network are all faked, so the suite runs

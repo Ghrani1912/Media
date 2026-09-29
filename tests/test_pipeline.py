@@ -70,9 +70,49 @@ def test_analyze_text_falls_back_when_noun_phrases_fail(monkeypatch):
             raise RuntimeError("no corpora")
 
     monkeypatch.setattr(process, "TextBlob", lambda text: _Boom())
+    monkeypatch.setattr(process, "_transformer_sentiment", lambda text: None)
     sentiment, keywords = process.analyze_text("the quick brown fox fox fox")
     assert sentiment == pytest.approx(0.1)
     assert "fox" in keywords
+
+
+def test_analyze_text_gaming_slang_reads_positive(monkeypatch):
+    """The transformer must read hype slang as positive where TextBlob can't."""
+    monkeypatch.setattr(process, "_transformer_sentiment",
+                        lambda text: 0.9 if "insane" in text else -0.8)
+    sentiment, _ = process.analyze_text(
+        "bro that flash was insane, absolutely cracked play")
+    assert sentiment > 0.5
+
+
+def test_analyze_text_transformer_failure_falls_back_to_textblob(monkeypatch):
+    """If the transformer is unavailable, TextBlob polarity drives the score."""
+    calls = []
+
+    def fake_blob(text):
+        calls.append(text)
+        return type("B", (), {
+            "sentiment": type("S", (), {"polarity": -0.5})(),
+            "noun_phrases": [],
+        })()
+
+    monkeypatch.setattr(process, "_transformer_sentiment", lambda text: None)
+    monkeypatch.setattr(process, "TextBlob", fake_blob)
+    sentiment, _ = process.analyze_text("This is terrible, awful and horrible.")
+    assert sentiment == pytest.approx(-0.5)
+    assert calls  # TextBlob was constructed
+
+
+def test_analyze_text_sentiment_model_off_uses_textblob(monkeypatch):
+    monkeypatch.setenv("SENTIMENT_MODEL", "off")
+    monkeypatch.setattr(process, "_sentiment_pipeline", None)
+    monkeypatch.setattr(process, "_sentiment_pipeline_attempted", False)
+    monkeypatch.setattr(process, "TextBlob", lambda text: type("B", (), {
+        "sentiment": type("S", (), {"polarity": 0.3})(),
+        "noun_phrases": [],
+    })())
+    sentiment, _ = process.analyze_text("anything at all")
+    assert sentiment == pytest.approx(0.3)
 
 
 def test_fallback_keywords_orders_by_frequency():

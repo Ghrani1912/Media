@@ -785,16 +785,49 @@ def test_capture_handles_a_channel_that_is_offline(monkeypatch, twitch):
     assert "offline" in report["note"]
 
 
-def test_vod_links_are_declined_with_a_reason(monkeypatch):
-    def _never(*args, **kwargs):  # a VOD must not even open a session
-        raise AssertionError("a VOD link should not open a playback session")
+def test_vod_links_resolve_to_the_live_channel_and_watch(monkeypatch, twitch):
+    """A /videos link now resolves to its channel and runs the live watcher."""
+    monkeypatch.setattr(twitch_ads, "_channel_for_vod", lambda vid: "gon_vl")
+    twitch["script"].extend(_single_ad_stream())
+    report = twitch_ads.capture_twitch_ads(
+        "https://www.twitch.tv/videos/2886229732", watch_seconds=12,
+        proof_dir=twitch["proof"], video_id="2886229732",
+    )
+    assert report["strategy"] == "live"
+    assert report["channel"] == "gon_vl"
+    assert report["vod_resolved_to"] == "gon_vl"
+    assert report["captured"] is True
+    assert report["ad_count"] == 3
 
+
+def test_vod_resolution_failure_still_declines_with_a_reason(monkeypatch):
+    def _never(*args, **kwargs):  # nothing to watch if the channel can't be told
+        raise AssertionError("no session should open without a channel")
+
+    monkeypatch.setattr(twitch_ads, "_channel_for_vod", lambda vid: None)
     monkeypatch.setattr(twitch_ads, "media_playlist_url", _never)
     report = twitch_ads.capture_twitch_ads("https://www.twitch.tv/videos/2886229732")
     assert report["available"] is True
     assert report["captured"] is False
     assert "no ad markers" in report["note"]
-    assert "live channel" in report["note"]
+    assert "could not be" in report["note"]
+
+
+def test_channel_for_vod_parses_gql_owner_login(monkeypatch):
+    def fake_gql(query):
+        assert 'video(id:"2886229732")' in query
+        return {"data": {"video": {"owner": {"login": "Caedrel"}}}}
+
+    monkeypatch.setattr(twitch_ads, "_gql", fake_gql)
+    assert twitch_ads._channel_for_vod("2886229732") == "caedrel"
+
+
+def test_channel_for_vod_survives_gql_errors(monkeypatch):
+    def boom(query):
+        raise twitch_ads.TwitchError("gql down")
+
+    monkeypatch.setattr(twitch_ads, "_gql", boom)
+    assert twitch_ads._channel_for_vod("2886229732") is None
 
 
 def test_playback_token_errors_surface_as_a_note(monkeypatch, twitch):

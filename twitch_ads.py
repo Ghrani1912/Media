@@ -209,6 +209,23 @@ def _fetch_text(url: str) -> str:
         return response.read().decode("utf-8", "replace")
 
 
+def _channel_for_vod(vod_id: str) -> str | None:
+    """The login of the channel a VOD belongs to, or None if it can't be told.
+
+    Used to turn a /videos/<id> link into a live watch of the same channel,
+    because VOD playlists never carry ad markers but live ones do.
+    """
+    try:
+        data = _gql('{video(id:"%s"){owner{login}}}' % vod_id)
+        login = (((data.get("data") or {}).get("video") or {})
+                 .get("owner") or {}).get("login")
+        return login.lower() if login else None
+    except Exception as exc:
+        logger.warning("Could not resolve VOD %s to a channel: %s",
+                       vod_id, str(exc)[:120])
+        return None
+
+
 def _usher_url(kind: str, ident: str, query: dict) -> str:
     # A channel's master playlist lives under /api/channel/hls; a VOD's does not.
     path = f"api/channel/hls/{ident}" if kind == "live" else f"vod/{ident}"
@@ -1270,16 +1287,25 @@ def capture_twitch_ads(url: str, watch_seconds: float | None = None,
     kind, ident = target
     result["channel"] = ident
     if kind == "vod":
-        result["strategy"] = "vod"
-        result["available"] = True
-        result["note"] = (
-            "Twitch VOD playlists carry no ad markers (the recorded timeline is the "
-            "stream's own media, and Twitch does not expose which parts of an archive "
-            "were ad breaks), so served ads cannot be read from a /videos link. Point "
-            "the capture at the live channel URL to catch pre-rolls and mid-rolls as "
-            "they air."
-        )
-        return result
+        # VOD playlists carry no ad markers, but the VOD belongs to a channel —
+        # resolve that channel and watch it live instead of refusing.
+        live_login = _channel_for_vod(ident)
+        if not live_login:
+            result["strategy"] = "vod"
+            result["available"] = True
+            result["note"] = (
+                "Twitch VOD playlists carry no ad markers (the recorded timeline is "
+                "the stream's own media, and Twitch does not expose which parts of "
+                "an archive were ad breaks), and the VOD's channel could not be "
+                "resolved for a live watch. Point the capture at the live channel "
+                "URL to catch pre-rolls and mid-rolls as they air."
+            )
+            return result
+        logger.info("VOD %s resolved to live channel '%s'; watching live.",
+                    ident, live_login)
+        result["channel"] = live_login
+        result["vod_resolved_to"] = live_login
+        kind, ident = "live", live_login
 
     started = time.time()
     budget = float(watch_seconds if watch_seconds else WATCH_SECONDS)
