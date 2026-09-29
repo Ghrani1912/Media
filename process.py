@@ -98,10 +98,28 @@ WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "small")
 # Decoder strategy. Greedy (1) is 2-3x faster than beam search for a marginal
 # accuracy cost; set WHISPER_BEAM_SIZE=5 for the old behavior.
 WHISPER_BEAM_SIZE_DEFAULT = int(os.environ.get("WHISPER_BEAM_SIZE", "1") or 1)
-# fp16 only helps on CUDA; WHISPER_FP16=1 enables it there.
-WHISPER_FP16_DEFAULT = os.environ.get("WHISPER_FP16", "").strip().lower() in {
-    "1", "true", "yes"
-}
+# Device for Whisper. WHISPER_DEVICE forces "cpu" or "cuda"; the default "auto"
+# uses the GPU when torch sees CUDA, which is ~5-10x faster than CPU.
+def _detect_device() -> str:
+    forced = os.environ.get("WHISPER_DEVICE", "auto").strip().lower()
+    if forced in {"cpu", "cuda"}:
+        return forced
+    try:
+        import torch
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    except Exception:  # torch always present here, but stay defensive
+        return "cpu"
+
+
+WHISPER_DEVICE_FORCED = os.environ.get("WHISPER_DEVICE", "auto").strip().lower()
+
+
+# fp16 halves GPU math with no quality loss; it does nothing on CPU. Default is
+# automatic: on when running on CUDA, off on CPU. WHISPER_FP16=1/0 forces it.
+_FP16_ENV = os.environ.get("WHISPER_FP16", "").strip().lower()
+WHISPER_FP16_DEFAULT: bool | None = (
+    _FP16_ENV in {"1", "true", "yes"} if _FP16_ENV else None
+)  # None = decide from the device at load time
 
 # Optional yt-dlp authentication, needed when YouTube asks to "confirm you're not
 # a bot". Point YTDLP_COOKIES at an exported cookies.txt, or set
@@ -109,8 +127,17 @@ WHISPER_FP16_DEFAULT = os.environ.get("WHISPER_FP16", "").strip().lower() in {
 YTDLP_COOKIES = os.environ.get("YTDLP_COOKIES")
 YTDLP_COOKIES_BROWSER = os.environ.get("YTDLP_COOKIES_FROM_BROWSER")
 
-# Loaded lazily and cached per model name.
+# Loaded lazily and cached per (device, model name).
 _MODEL_CACHE: dict[str, object] = {}
+_DEVICE: str | None = None
+
+
+def _resolve_device() -> str:
+    """Pick the Whisper device once: auto -> cuda when available, else cpu."""
+    global _DEVICE
+    if _DEVICE is None:
+        _DEVICE = _detect_device()
+    return _DEVICE
 
 # The Flask dev server runs threaded, so serialize Excel read-modify-write to
 # avoid two requests corrupting the report.
@@ -139,9 +166,16 @@ def report_stage(job_id: str | None, stage: str, detail: str = "") -> None:
 
 
 def pop_stage(job_id: str) -> dict | None:
-    """Consume and clear the latest stage for ``job_id`` (read by the poller)."""
+    """Latest stage announcement without consuming it.
+
+    The poller calls this every couple of seconds; popping would make the UI
+    fall back to its "fetch" default during every quiet stretch (e.g. minutes
+    inside Whisper), so peeking is the correct read semantics. Entries are
+    reclaimed by the stale-prune in :func:`report_stage` instead.
+    """
     with _STAGE_LOCK:
-        return _JOB_STAGES.pop(job_id, None)
+        info = _JOB_STAGES.get(job_id)
+        return dict(info) if info else None
 
 
 def _js_runtimes() -> dict:
@@ -417,12 +451,36 @@ def extract_audio(video_path: str) -> str:
     return audio_path
 
 
-def _get_model(name: str | None = None):
+def _get_model(name: str | None = None, device: str | None = None):
+    """Load and cache the Whisper model on ``device`` (default: auto-detected).
+
+    A GPU load that fails at the last moment (driver busy, OOM) falls back to
+    CPU so an analysis never dies over placement.
+    """
     name = name or WHISPER_MODEL
-    if name not in _MODEL_CACHE:
-        logger.info("Loading Whisper model '%s'", name)
-        _MODEL_CACHE[name] = whisper.load_model(name)
-    return _MODEL_CACHE[name]
+    device = device or _resolve_device()
+    key = f"{device}:{name}"
+    if key not in _MODEL_CACHE:
+        logger.info("Loading Whisper model '%s' on %s", name, device)
+        try:
+            _MODEL_CACHE[key] = whisper.load_model(name, device=device)
+        except Exception as exc:
+            if device == "cpu":
+                raise
+            logger.warning("Whisper on %s failed (%s); falling back to CPU.",
+                           device, str(exc)[:120])
+            _MODEL_CACHE[key] = whisper.load_model(name, device="cpu")
+    return _MODEL_CACHE[key]
+
+
+# Tensor-shape RuntimeErrors Whisper can throw mid-decode (beam-search width
+# mismatch on odd audio; empty-tensor reshape on CUDA with silent chunks). All
+# are transient decode-strategy problems, not corrupt input, so the caller
+# retries with progressively more conservative settings instead of failing.
+_TENSOR_SHAPE_ERRORS = (
+    "Sizes of tensors must match",
+    "cannot reshape tensor of 0 elements",
+)
 
 
 def transcribe(audio_path: str, model_name: str | None = None,
@@ -431,26 +489,42 @@ def transcribe(audio_path: str, model_name: str | None = None,
 
     ``beam_size=5`` trades a little speed for better accuracy than the default
     greedy decoder. Segments are needed for transcript-based ad detection.
+
+    Recovery ladder for decode-time tensor errors: (1) configured settings,
+    (2) greedy + fp32 on the same device, (3) CPU for this file when running on
+    CUDA — CPU is Whisper's best-tested path.
     """
     model = _get_model(model_name)
+    on_cuda = str(getattr(model, "device", "cpu")).startswith("cuda")
     use_fp16 = WHISPER_FP16_DEFAULT
+    if use_fp16 is None:  # auto: fp16 only makes sense on CUDA
+        use_fp16 = on_cuda
     beam_size = WHISPER_BEAM_SIZE_DEFAULT
+
+    def _run(m, fp16, beam):
+        return m.transcribe(
+            audio_path, fp16=fp16, beam_size=beam, language=language
+        )
+
     try:
-        result = model.transcribe(
-            audio_path, fp16=use_fp16, beam_size=beam_size, language=language
-        )
+        result = _run(model, use_fp16, beam_size)
     except RuntimeError as exc:
-        # Very short or unusual audio trips a known Whisper bug in beam search
-        # ("Sizes of tensors must match ... Expected size 5 but got size 1").
-        # Greedy decoding has no such constraint, so retry with it instead of
-        # failing the whole analysis.
-        if "Sizes of tensors must match" not in str(exc):
+        msg = str(exc)
+        if not any(marker in msg for marker in _TENSOR_SHAPE_ERRORS):
             raise
-        logger.warning("Whisper beam search failed on %s (%s); retrying greedy.",
-                       audio_path, str(exc)[:120])
-        result = model.transcribe(
-            audio_path, fp16=use_fp16, beam_size=1, language=language
-        )
+        logger.warning("Whisper decode failed on %s (%s); retrying greedy+fp32.",
+                       audio_path, msg[:120])
+        try:
+            result = _run(model, False, 1)
+        except RuntimeError as exc2:
+            msg2 = str(exc2)
+            if not any(marker in msg2 for marker in _TENSOR_SHAPE_ERRORS) \
+                    or not on_cuda:
+                raise
+            logger.warning("Whisper still failing on CUDA (%s); using CPU for "
+                           "this file.", msg2[:120])
+            model = _get_model(model_name, device="cpu")
+            result = _run(model, False, 1)
     segments = [
         {
             "start": float(s.get("start", 0.0)),
@@ -463,6 +537,7 @@ def transcribe(audio_path: str, model_name: str | None = None,
         "text": (result.get("text") or "").strip(),
         "segments": segments,
         "language": result.get("language"),
+        "device": str(getattr(model, "device", "cpu")),
     }
 
 
@@ -668,9 +743,10 @@ def process_video(link: str | None = None, file_path: str | None = None,
                                           daemon=True)
         capture_thread.start()
 
+    _device = _resolve_device()
     report_stage(job_id, "transcribe",
-                 f"whisper {model_name or WHISPER_MODEL} on "
-                 f"{os.path.basename(audio_path)}")
+                 f"whisper {model_name or WHISPER_MODEL} on {_device.upper()} "
+                 f"— {os.path.basename(audio_path)}")
     result = transcribe(audio_path, model_name=model_name, language=language)
     transcript = result["text"]
     sentiment, keywords = analyze_text(transcript)
@@ -721,6 +797,7 @@ def process_video(link: str | None = None, file_path: str | None = None,
         "keywords": keywords,
         "report": report_path,
         "model": model_name or WHISPER_MODEL,
+        "device": result.get("device", "cpu"),
         "language": result.get("language"),
         "ads": ad_report,
         "served": served_report or ad_report.get("served") or {},

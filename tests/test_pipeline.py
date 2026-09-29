@@ -198,6 +198,8 @@ def test_transcribe_retries_greedy_when_beam_search_blows_up(monkeypatch, audio_
     monkeypatch.setattr(process, "WHISPER_FP16_DEFAULT", False)
 
     class _FlakyModel:
+        device = "cpu"
+
         def transcribe(self, path, **kwargs):
             calls.append(kwargs.get("beam_size"))
             if kwargs.get("beam_size") == 5:
@@ -205,7 +207,7 @@ def test_transcribe_retries_greedy_when_beam_search_blows_up(monkeypatch, audio_
                                    "Expected size 5 but got size 1 for tensor number 1 in the list.")
             return {"text": " recovered", "segments": [], "language": "en"}
 
-    monkeypatch.setattr(process, "_get_model", lambda name=None: _FlakyModel())
+    monkeypatch.setattr(process, "_get_model", lambda name=None, device=None: _FlakyModel())
     result = process.transcribe(audio_file)
     assert result["text"] == "recovered"
     assert calls == [5, 1]  # beam first, then the greedy retry
@@ -213,12 +215,166 @@ def test_transcribe_retries_greedy_when_beam_search_blows_up(monkeypatch, audio_
 
 def test_transcribe_reraises_other_runtime_errors(monkeypatch, audio_file):
     class _BrokenModel:
+        device = "cpu"
+
         def transcribe(self, path, **kwargs):
             raise RuntimeError("CUDA out of memory")
 
-    monkeypatch.setattr(process, "_get_model", lambda name=None: _BrokenModel())
+    monkeypatch.setattr(process, "_get_model", lambda name=None, device=None: _BrokenModel())
     with pytest.raises(RuntimeError, match="CUDA out of memory"):
         process.transcribe(audio_file)
+
+
+def test_transcribe_cuda_empty_tensor_recovers_greedy_fp32_then_cpu(monkeypatch, audio_file):
+    """The CUDA empty-tensor reshape bug recovers greedy+fp32, then on CPU."""
+    calls = []
+
+    class _CudaFlaky:
+        device = "cuda:0"
+
+        def transcribe(self, path, **kwargs):
+            calls.append((kwargs.get("beam_size"), kwargs.get("fp16")))
+            if kwargs.get("fp16") or kwargs.get("beam_size", 1) > 1:
+                raise RuntimeError("cannot reshape tensor of 0 elements into shape "
+                                   "[1, 0, 8, -1] because the unspecified dimension "
+                                   "size -1 can be any value and is ambiguous")
+            return {"text": " ok", "segments": [], "language": "en"}
+
+    monkeypatch.setattr(
+        process, "_get_model",
+        lambda name=None, device=None: _CudaFlaky() if device in (None, "cuda:0")
+        else _device_model("cpu"))
+    result = process.transcribe(audio_file)
+    assert result["text"] == "ok"
+    assert calls == [(1, True), (1, False)]  # auto fp16, then fp32 retry on GPU
+
+
+def test_transcribe_cuda_error_on_cpu_model_reraises(monkeypatch, audio_file):
+    calls = []
+
+    class _CpuFlaky:
+        device = "cpu"
+
+        def transcribe(self, path, **kwargs):
+            calls.append(kwargs.get("beam_size"))
+            raise RuntimeError("cannot reshape tensor of 0 elements into shape [1, 0, 8, -1]")
+
+    monkeypatch.setattr(process, "_get_model", lambda name=None, device=None: _CpuFlaky())
+    with pytest.raises(RuntimeError, match="cannot reshape"):
+        process.transcribe(audio_file)
+    assert calls == [1, 1]  # configured beam, then the greedy retry — then give up
+
+
+def _device_model(device_str):
+    class _Model:
+        device = device_str
+
+        def transcribe(self, path, **kwargs):
+            return {"text": " hi", "segments": [], "language": "en"}
+
+    return _Model()
+
+
+def test_whisper_auto_runs_on_cuda_when_available(monkeypatch, audio_file):
+    """Auto device must pick the GPU when torch sees CUDA."""
+    monkeypatch.setattr(process, "WHISPER_FP16_DEFAULT", None)
+    loads = []
+
+    def fake_load(name, device="cpu"):
+        loads.append(device)
+        return _device_model("cuda")
+
+    monkeypatch.setattr(process.whisper, "load_model", fake_load)
+    monkeypatch.setattr(process, "_DEVICE", None)  # reset auto-detect cache
+    monkeypatch.setattr(process, "_MODEL_CACHE", {})
+    monkeypatch.setattr(process, "_detect_device", lambda: "cuda")
+
+    result = process.transcribe(audio_file)
+    assert loads == ["cuda"]
+    assert result["device"] == "cuda"
+    # fp16 auto-enables on CUDA
+    assert process.WHISPER_FP16_DEFAULT is None
+
+
+def test_whisper_auto_stays_on_cpu_without_cuda(monkeypatch, audio_file):
+    monkeypatch.setattr(process, "WHISPER_FP16_DEFAULT", None)
+    loads = []
+
+    class _CpuModel:
+        device = "cpu"
+
+        def transcribe(self, path, **kwargs):
+            # fp16 must be forced off on CPU when left on auto
+            assert kwargs.get("fp16") is False
+            return {"text": " hi", "segments": [], "language": "en"}
+
+    def fake_load(name, device="cpu"):
+        loads.append(device)
+        return _CpuModel()
+
+    monkeypatch.setattr(process.whisper, "load_model", fake_load)
+    monkeypatch.setattr(process, "_DEVICE", None)
+    monkeypatch.setattr(process, "_MODEL_CACHE", {})
+    monkeypatch.setattr(process, "_detect_device", lambda: "cpu")
+
+    result = process.transcribe(audio_file)
+    assert loads == ["cpu"]
+    assert result["device"] == "cpu"
+
+
+def test_whisper_gpu_load_failure_falls_back_to_cpu(monkeypatch, audio_file):
+    loads = []
+
+    def fake_load(name, device="cpu"):
+        loads.append(device)
+        if device != "cpu":
+            raise RuntimeError("CUDA error: out of memory")
+        return _device_model("cpu")
+
+    monkeypatch.setattr(process.whisper, "load_model", fake_load)
+    monkeypatch.setattr(process, "_DEVICE", None)
+    monkeypatch.setattr(process, "_MODEL_CACHE", {})
+    monkeypatch.setattr(process, "_detect_device", lambda: "cuda")
+
+    result = process.transcribe(audio_file)
+    assert loads == ["cuda", "cpu"]
+    assert result["device"] == "cpu"
+
+
+def test_whisper_forced_device_env_overrides_auto(monkeypatch, audio_file):
+    monkeypatch.setenv("WHISPER_DEVICE", "cpu")
+    loads = []
+
+    def fake_load(name, device="cpu"):
+        loads.append(device)
+        return _device_model("cpu")
+
+    monkeypatch.setattr(process.whisper, "load_model", fake_load)
+    monkeypatch.setattr(process, "_DEVICE", None)
+    monkeypatch.setattr(process, "_MODEL_CACHE", {})
+
+    process.transcribe(audio_file)
+    assert loads == ["cpu"]
+
+
+def test_whisper_model_cache_is_per_device(monkeypatch):
+    cache = {}
+    loads = []
+
+    def fake_load(name, device="cpu"):
+        loads.append((device, name))
+        return _device_model(device)
+
+    monkeypatch.setattr(process.whisper, "load_model", fake_load)
+    monkeypatch.setattr(process, "_DEVICE", None)
+    monkeypatch.setattr(process, "_MODEL_CACHE", cache)
+    monkeypatch.setattr(process, "_detect_device", lambda: "cuda")
+
+    process._get_model("tiny")
+    process._get_model("tiny", device="cpu")
+    process._get_model("tiny")  # cached hit, no new load
+    assert loads == [("cuda", "tiny"), ("cpu", "tiny")]
+    assert len(cache) == 2
 
 
 def test_process_video_includes_ad_report(monkeypatch, audio_file, tmp_path):

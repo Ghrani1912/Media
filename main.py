@@ -209,7 +209,8 @@ def _run_job(job_id: str, **kwargs) -> None:
 
 
 def _pop_unseen_stage(job_id: str) -> dict | None:
-    """Latest un-polled stage announcement, if any."""
+    """The job's current stage announcement (peeked, not consumed — the label
+    must hold steady through quiet stretches instead of resetting to fetch)."""
     return pop_stage(job_id)
 
 

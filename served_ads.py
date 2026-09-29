@@ -275,9 +275,30 @@ def _build_options(headless: bool):
 
 
 def _new_driver(headless: bool):
-    from selenium import webdriver
+    """Start Chrome, retrying once with a throwaway profile on a failed launch.
 
-    driver = webdriver.Chrome(options=_build_options(headless))
+    "session not created: Chrome instance exited" almost always means the
+    shared capture profile was locked by an orphaned chrome.exe or left in a
+    state a Chrome update can't reuse. A throwaway profile sidesteps both;
+    the capture loses its cookies, which YouTube does not require.
+    """
+    from selenium import webdriver
+    from selenium.common.exceptions import SessionNotCreatedException
+
+    opts = _build_options(headless)
+    try:
+        driver = webdriver.Chrome(options=opts)
+    except SessionNotCreatedException as exc:
+        if "Chrome instance exited" not in str(exc) and "devtoolsActivePort" \
+                not in str(exc).lower():
+            raise
+        logger.warning("Chrome launch failed with the capture profile (%s); "
+                       "retrying with a fresh profile.", str(exc)[:140])
+        fresh = _build_options(headless)
+        fresh.add_argument(
+            f"--user-data-dir={tempfile.mkdtemp(prefix='ma-chrome-')}"
+        )
+        driver = webdriver.Chrome(options=fresh)
     try:
         driver.execute_cdp_cmd(
             "Page.addScriptToEvaluateOnNewDocument",

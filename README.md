@@ -119,6 +119,18 @@ System requirements that pip cannot provide:
 * `numpy<2.2` is pinned in `requirements.txt` because `openai-whisper` pulls in
   numba, which does not work with newer NumPy.
 
+## GPU acceleration (automatic)
+
+Transcription runs on your NVIDIA GPU when one is present — measured on an RTX
+4050 Laptop with the `small` model over a 27-minute video: **302 s on CPU →
+120 s on GPU (2.5× faster end-to-end)**, and the GPU frees the CPU for the
+parallel ad capture. fp16 is enabled automatically on CUDA. No setup is needed
+if `python -c "import torch; print(torch.cuda.is_available())"` prints `True`
+(the bundled torch is the CUDA build). Force either side with `WHISPER_DEVICE=
+cpu` or `WHISPER_DEVICE=cuda`; a GPU that fails at load time (driver busy, OOM)
+automatically falls back to CPU, and the report header shows the device that
+actually ran (`MODEL: small · CUDA:0`).
+
 ## Configuration
 
 Everything is environment variables; the defaults are sane.
@@ -128,6 +140,9 @@ Everything is environment variables; the defaults are sane.
 | Variable | Default | Meaning |
 |---|---|---|
 | `WHISPER_MODEL` | `small` | `tiny`/`base`/`small`/`medium`/`large` |
+| `WHISPER_DEVICE` | `auto` | `auto` uses the GPU when torch sees CUDA (recommended); force `cpu` or `cuda` |
+| `WHISPER_FP16` | auto | fp16 math: on by default on CUDA, off on CPU; `1`/`0` forces it |
+| `WHISPER_BEAM_SIZE` | `1` | Greedy decoding; `5` = old slower beam search |
 | `MEDIA_REPORT` | `./media_report.xlsx` | Where the Excel report lives |
 | `YTDLP_COOKIES` | – | A `cookies.txt`, for when YouTube blocks the bot |
 | `YTDLP_COOKIES_FROM_BROWSER` | – | `chrome`/`firefox`/`edge` instead |
@@ -199,7 +214,7 @@ proof/
 ## Tests
 
 ```
-mediaenv311/Scripts/python.exe -m pytest -q      # 179 passed
+mediaenv311/Scripts/python.exe -m pytest -q      # 186 passed
 ```
 
 Whisper, yt-dlp, Chrome, ffmpeg and the network are all faked, so the suite runs

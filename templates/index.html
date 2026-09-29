@@ -44,7 +44,7 @@
             <span class="report-source-tag">BROADCAST RECORD — {{ result.platform|upper }}</span>
             <h2 class="report-media-title">{{ result.title }}</h2>
             <div class="report-meta-line">
-                <div>MODEL: <span>{{ result.model }}</span></div>
+                <div>MODEL: <span>{{ result.model }}{% if result.device %} · {{ result.device|upper }}{% endif %}</span></div>
                 <div>LANGUAGE: <span>{{ (result.language or '—')|upper }}</span></div>
                 <div>ANALYSIS: <span>WHISPER + TEXTBLOB</span></div>
             </div>
