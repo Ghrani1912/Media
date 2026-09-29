@@ -400,9 +400,50 @@ body {
     color: var(--color-red);
     transform: translate(-1px, -1px);
     box-shadow: 5px 5px 0 var(--color-ink);
+}.btn-analyze:active {
+    transform: translate(4px, 4px);
+    box-shadow: var(--shadow-hard-pressed);
 }
 
-.btn-analyze:active { transform: translate(4px, 4px); box-shadow: var(--shadow-hard-pressed); }
+/* Action row: analyze + stop share the line */
+.action-row {
+    display: flex;
+    gap: 14px;
+    align-items: stretch;
+}
+
+.action-row .btn-analyze {
+    flex: 1;
+}
+
+/* STOP: flat ink block with hard red border; appears only while a job runs */
+.btn-stop {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 140px;
+    background: var(--color-ink);
+    color: var(--color-white);
+    font-family: var(--font-display);
+    font-size: 22px;
+    font-weight: 900;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    border: var(--border-thick);
+    box-shadow: 4px 4px 0 var(--color-red);
+    cursor: pointer;
+    transition: background var(--timing-snappy), color var(--timing-snappy);
+}
+
+.btn-stop:hover {
+    background: var(--color-red);
+    color: var(--color-white);
+}
+
+.btn-stop:disabled {
+    opacity: 0.55;
+    cursor: wait;
+}
 
 .btn-analyze.loading-mode {
     background: var(--color-ink);

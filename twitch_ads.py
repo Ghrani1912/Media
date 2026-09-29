@@ -1186,13 +1186,13 @@ def write_creatives_index(registry: CreativeRegistry, proof_dir: str) -> str | N
 
 
 def watch_live(media_url: str, collector: AdCollector, budget: float,
-               started: float) -> dict:
+               started: float, cancel_check=None) -> dict:
     """Poll the playlist until the budget runs out, recording every ad break."""
     stats = {"polls": 0, "failed_polls": 0, "content_duration": None, "ads": 0}
     deadline = started + budget
     while True:
         now = time.time()
-        if now >= deadline:
+        if now >= deadline or cancel_requested(cancel_check):
             break
         parsed = _poll_playlist(media_url)
         if parsed is not None:
@@ -1216,6 +1216,14 @@ def _poll_playlist(media_url: str) -> dict | None:
     except Exception as exc:
         logger.debug("could not read the Twitch playlist: %s", exc)
         return None
+
+
+def cancel_requested(cancel_check) -> bool:
+    """True when the caller asked this capture to stop (never raises)."""
+    try:
+        return bool(cancel_check()) if cancel_check else False
+    except Exception:
+        return False
 
 
 def _advance(collector: AdCollector, parsed: dict, edge: float | None,
@@ -1254,7 +1262,8 @@ def capture_twitch_ads(url: str, watch_seconds: float | None = None,
                        record: bool | None = None,
                        full_watch: bool | None = None,
                        max_seconds: float | None = None,
-                       video_id: str | None = None) -> dict:
+                       video_id: str | None = None,
+                       cancel_check=None) -> dict:
     """Record the ads Twitch stitches into a live stream, without a browser.
 
     Signature-compatible with ``served_ads.capture_served_ads`` so the pipeline
@@ -1340,7 +1349,10 @@ def capture_twitch_ads(url: str, watch_seconds: float | None = None,
         channel=ident,
     )
     try:
-        stats = watch_live(media_url, collector, budget, started)
+        stats = watch_live(media_url, collector, budget, started,
+                           cancel_check=cancel_check)
+        if cancel_requested(cancel_check):
+            result["cancelled"] = True
     except Exception as exc:  # capture must never break the pipeline
         logger.warning("Twitch ad capture failed: %s", exc)
         result["note"] = f"Twitch ad capture failed: {exc}"
@@ -1373,6 +1385,11 @@ def capture_twitch_ads(url: str, watch_seconds: float | None = None,
             result["creative_count"] = len(registry.entries)
             result["creatives_index"] = write_creatives_index(registry, proof.proof_dir)
     result["note"] = _note(result, ads, ident, stats)
+    if result.get("cancelled"):
+        result["note"] += (
+            f" Capture was stopped early at the user's request "
+            f"after {int(result['watched_seconds'])}s."
+        )
     return result
 
 

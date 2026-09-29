@@ -179,6 +179,39 @@ def _resolve_device() -> str:
 # avoid two requests corrupting the report.
 _REPORT_LOCK = threading.Lock()
 
+# ---- Cancellation ---------------------------------------------------------- #
+# Jobs the user asked to stop. A set of job ids checked by the long-running
+# loops (download nudges, the browser sweep, the Twitch playlist watch), which
+# each bail out at their next tick. The worker thread itself is a daemon, so a
+# job that is inside a non-interruptible call (Whisper on a chunk) finishes
+# that call and then stops cleanly — cancellation is cooperative by design.
+_CANCEL_LOCK = threading.Lock()
+_CANCELLED: set[str] = set()
+
+
+def request_cancel(job_id: str | None) -> bool:
+    """Flag ``job_id`` for cancellation; returns True if a job was flagged."""
+    if not job_id:
+        return False
+    with _CANCEL_LOCK:
+        _CANCELLED.add(job_id)
+    return True
+
+
+def cancel_requested(job_id: str | None) -> bool:
+    if not job_id:
+        return False
+    with _CANCEL_LOCK:
+        return job_id in _CANCELLED
+
+
+def _clear_cancel(job_id: str | None) -> None:
+    if not job_id:
+        return
+    with _CANCEL_LOCK:
+        _CANCELLED.discard(job_id)
+
+
 # Live pipeline stages, published for the web UI's progress readout. Keys are
 # job ids (``uuid4`` hex from main.py), values {"stage": str, "started": float,
 # "detail": str}. ``stage`` is one of fetch/transcribe/ads/done/error. Anything
@@ -819,6 +852,7 @@ def process_video(link: str | None = None, file_path: str | None = None,
                     watch_seconds=served_watch_seconds,
                     proof_dir=proof_dir,
                     video_id=ads.extract_video_id(link),
+                    cancel_check=lambda: cancel_requested(job_id),
                 )
             except Exception as exc:  # capture must never break the pipeline
                 logger.warning("Served-ad capture failed: %s", exc)

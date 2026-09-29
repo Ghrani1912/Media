@@ -182,6 +182,62 @@ _EXTRACT_JS = r"""
   });
 """
 
+# Reads the Twitch VOD player's ad overlay and transport state. Twitch renders
+# a purple "_ad-overlay" root while an ad plays, with advertiser text, a CTA
+# and (newer layouts) a countdown; the <video> element is the ad itself, so the
+# playhead/duration readouts work exactly like YouTube's. Same bare-body/return
+# contract as _EXTRACT_JS above.
+_TWITCH_EXTRACT_JS = r"""
+  const q = (s) => document.querySelector(s);
+  const t = (s) => { const el = q(s); return el ? el.textContent.trim() : null; };
+
+  const video = q('video');
+  const overlay = q('[data-a-target="video-ad-overlay"]')
+      || q('.ad-showing') || q('.video-refactor-ad-layout');
+
+  let contentTime = null, contentDuration = null, ended = false, paused = true;
+  try {
+    if (video) {
+      ended = video.ended; paused = video.paused;
+      if (!isNaN(video.duration) && video.duration > 0 && !video.ended) {
+        // While an ad plays the element IS the ad; otherwise it is the VOD.
+        if (overlay) { var adDuration = video.duration; var adTime = video.currentTime; }
+        else {
+          contentDuration = video.duration;
+          contentTime = video.currentTime;
+        }
+      }
+    }
+  } catch (e) {}
+
+  const countdown = t('[data-a-target="video-ad-label"]')
+      || t('.ad-countdown') || t('[class*="ad-countdown"]');
+  const podText = (countdown || '') + ' ' + (t('[class*="ad-overlay"]') || '');
+  const pod = podText.match(/(\d+)\s*of\s*(\d+)/);
+
+  let rect = null;
+  try { const p = q('.video-player__container') || q('video'); if (p) { const r = p.getBoundingClientRect(); rect = {x: r.x, y: r.y, w: r.width, h: r.height}; } } catch (e) {}
+
+  return JSON.stringify({
+    showing: !!overlay,
+    advertiser: t('[data-a-target="video-ad-banner-title"]') || t('[class*="ad-overlay"] [class*="brand"]'),
+    destination: t('[data-a-target="video-ad-banner-subtitle"]'),
+    cta: t('[data-a-target="video-ad-cta"]') || t('[class*="ad-overlay"] button span'),
+    badge: countdown,
+    ad_index: pod ? parseInt(pod[1], 10) : null,
+    ad_pod_size: pod ? parseInt(pod[2], 10) : null,
+    ad_time: typeof adTime !== 'undefined' ? adTime : null,
+    ad_duration: typeof adDuration !== 'undefined' ? adDuration : null,
+    skippable: false,
+    skip_text: null,
+    content_time: contentTime,
+    content_duration: contentDuration,
+    ended: ended,
+    paused: paused,
+    player_rect: rect
+  });
+"""
+
 # The rolling gallery of Twitch creatives, written by ``twitch_ads``; the proof
 # index links to it whenever it sits beside the frames.
 CREATIVES_PAGE = "creatives.html"
@@ -309,10 +365,10 @@ def _new_driver(headless: bool):
     return driver
 
 
-def _poll(driver) -> dict | None:
+def _poll(driver, extract_js: str | None = None) -> dict | None:
     """Read one snapshot of the player's ad state, or None if it can't be read."""
     try:
-        raw = driver.execute_script(_EXTRACT_JS)
+        raw = driver.execute_script(extract_js or _EXTRACT_JS)
     except Exception as exc:
         logger.warning("ad overlay read failed: %s", exc)
         return None
@@ -962,7 +1018,8 @@ def _summarize(ad: dict) -> str:
 # --------------------------------------------------------------------------- #
 # Watch strategies
 # --------------------------------------------------------------------------- #
-def _warmup(driver, tracker: _Tracker, deadline: float, started: float) -> None:
+def _warmup(driver, tracker: _Tracker, deadline: float, started: float,
+            cancel_check=None, extract_js: str | None = None) -> None:
     """Film the opening moments, before any watch window starts.
 
     The pre-roll usually starts while the watch page is still settling, so those
@@ -972,8 +1029,8 @@ def _warmup(driver, tracker: _Tracker, deadline: float, started: float) -> None:
     dismissed again for as long as the player has not appeared.
     """
     until = min(deadline, time.time() + WARMUP_SECONDS)
-    while time.time() < until:
-        snap = _poll(driver)
+    while time.time() < until and not _cancelled(cancel_check):
+        snap = _poll(driver, extract_js)
         if snap is not None:
             if snap.get("player_rect") is None and not snap.get("showing"):
                 _dismiss_consent(driver)
@@ -981,21 +1038,23 @@ def _warmup(driver, tracker: _Tracker, deadline: float, started: float) -> None:
         time.sleep(1.0)
 
 
-def _linear_watch(driver, tracker: _Tracker, deadline: float, started: float) -> None:
+def _linear_watch(driver, tracker: _Tracker, deadline: float, started: float,
+                  cancel_check=None, extract_js: str | None = None) -> None:
     """Poll every second until the deadline (used when a budget is given)."""
-    while time.time() < deadline:
-        snap = _poll(driver)
+    while time.time() < deadline and not _cancelled(cancel_check):
+        snap = _poll(driver, extract_js)
         if snap is not None:
             tracker.update(snap, time.time() - started)
         time.sleep(1.0)
 
 
-def _full_watch(driver, tracker: _Tracker, deadline: float, started: float) -> None:
+def _full_watch(driver, tracker: _Tracker, deadline: float, started: float,
+                cancel_check=None, extract_js: str | None = None) -> None:
     """Play right through the video, stopping when it ends."""
     stalled = 0
     last = -1.0
-    while time.time() < deadline:
-        snap = _poll(driver)
+    while time.time() < deadline and not _cancelled(cancel_check):
+        snap = _poll(driver, extract_js)
         if snap is not None:
             tracker.update(snap, time.time() - started)
             if not snap.get("showing"):
@@ -1013,21 +1072,23 @@ def _full_watch(driver, tracker: _Tracker, deadline: float, started: float) -> N
 
 
 def _watch_window(driver, tracker: _Tracker, deadline: float, started: float,
-                  seconds: float) -> float | None:
+                  seconds: float, cancel_check=None,
+                  extract_js: str | None = None) -> float | None:
     """Poll for ``seconds`` -- but never walk away from an ad that is playing.
 
     Leaving mid-ad would cut the ad out of its own proof clip and, worse, hide the
     return to content, which is half of what the recording exists to show. So the
     window stretches while an ad is on screen (capped by ``AD_WAIT_SECONDS``) and
     closes a moment after the content comes back. Returns the content duration if
-    the player reported one.
+    the player reported one. A cancellation still stops even mid-ad: the user's
+    stop button outranks the proof clip.
     """
     duration = None
     stop_until = min(deadline, time.time() + seconds)
     ad_deadline = None
     waiting_on_ad = False
-    while time.time() < stop_until:
-        snap = _poll(driver)
+    while time.time() < stop_until and not _cancelled(cancel_check):
+        snap = _poll(driver, extract_js)
         if snap is not None:
             tracker.update(snap, time.time() - started)
             if snap.get("content_duration"):
@@ -1050,11 +1111,13 @@ def _watch_window(driver, tracker: _Tracker, deadline: float, started: float,
     return duration
 
 
-def _sweep_watch(driver, tracker: _Tracker, deadline: float, started: float) -> dict:
+def _sweep_watch(driver, tracker: _Tracker, deadline: float, started: float,
+                 cancel_check=None, extract_js: str | None = None) -> dict:
     """Watch the opening, then seek along the timeline to trigger mid-rolls."""
     info = {"seek_stops": 0, "content_duration": None}
     info["content_duration"] = _watch_window(
-        driver, tracker, deadline, started, PRE_ROLL_SECONDS
+        driver, tracker, deadline, started, PRE_ROLL_SECONDS,
+        cancel_check=cancel_check, extract_js=extract_js,
     )
 
     duration = info["content_duration"]
@@ -1062,14 +1125,15 @@ def _sweep_watch(driver, tracker: _Tracker, deadline: float, started: float) -> 
         return info
 
     for position in _sweep_positions(duration, SEEK_STEP_SECONDS):
-        if time.time() >= deadline:
+        if time.time() >= deadline or _cancelled(cancel_check):
             break
         tracker.trigger = f"seek@{int(position)}"
         tracker.freeze()  # post-roll frames from the old position are not evidence
         tracker.checkpoint(driver, time.time() - started)
         _seek(driver, position)
         info["seek_stops"] += 1
-        _watch_window(driver, tracker, deadline, started, SEEK_DWELL_SECONDS)
+        _watch_window(driver, tracker, deadline, started, SEEK_DWELL_SECONDS,
+                      cancel_check=cancel_check, extract_js=extract_js)
         tracker.trigger = "playback"
     return info
 
@@ -1095,20 +1159,90 @@ def _sweep_positions(duration: float, step: float) -> list[float]:
 # --------------------------------------------------------------------------- #
 # Public entry point
 # --------------------------------------------------------------------------- #
+def _cancelled(cancel_check) -> bool:
+    """True when the caller asked this capture to stop."""
+    try:
+        return bool(cancel_check()) if cancel_check else False
+    except Exception:
+        return False
+
+
+def _load_page(driver, url: str) -> None:
+    """Open ``url``, tolerating one renderer hang with a reload.
+
+    Heavy pages (Twitch especially) can outlast the load timeout while still
+    being usable — the player keeps initializing — so a timeout is retried once
+    and only a second failure propagates to the caller's error note.
+    """
+    from selenium.common.exceptions import TimeoutException
+
+    try:
+        driver.get(url)
+    except TimeoutException:
+        logger.warning("page load timed out for %s; retrying once", url)
+        try:
+            driver.get(url)
+        except TimeoutException:
+            pass
+
+
+def capture_vod_sweep(url: str, watch_seconds: float | None = None,
+                      headless: bool | None = None,
+                      proof_dir: str | None = None,
+                      record: bool | None = None,
+                      max_seconds: float | None = None,
+                      video_id: str | None = None,
+                      cancel_check=None,
+                      extract_js: str | None = None) -> dict:
+    """Sweep a **VOD** (e.g. a Twitch archive) for served ads in a browser.
+
+    A VOD player is served ads the same way YouTube's is, so this reuses the
+    whole YouTube machinery — tracker, recorder, seek sweep, proof writers —
+    with a different overlay-extraction script, and relabels the report so it
+    stays attributable (``source: vod-browser``, ``strategy: vod-sweep``).
+    """
+    # ``watch_seconds`` must become the sweep BUDGET, not a window: a window
+    # would make the inner reader park and watch linearly instead of seeking
+    # across the timeline, which is the whole point of a VOD sweep.
+    budget = watch_seconds if watch_seconds is not None else max_seconds
+    report = _capture_youtube_like(
+        url, watch_seconds=None, headless=headless,
+        proof_dir=proof_dir, record=record, full_watch=False,
+        max_seconds=budget, video_id=video_id,
+        cancel_check=cancel_check, extract_js=extract_js,
+    )
+    report["source"] = "vod-browser"
+    report["strategy"] = "vod-sweep"
+    if report.get("captured"):
+        report["note"] = (
+            f"Swept the VOD's timeline and captured {report['ad_count']} served "
+            "ad(s) the player injected at the seek stops."
+        )
+    elif not report.get("note", "").startswith(("Live ad capture", "Capture was")):
+        report["note"] = (
+            "Swept the VOD's timeline in Chrome and the player served no ad in "
+            "this session. VOD ads are personalized per viewer and run, so a "
+            "repeat sweep can differ."
+        )
+    return report
+
+
 def capture_served_ads(url: str, watch_seconds: float | None = None,
                        headless: bool | None = None,
                        proof_dir: str | None = None,
                        record: bool | None = None,
                        full_watch: bool | None = None,
                        max_seconds: float | None = None,
-                       video_id: str | None = None) -> dict:
+                       video_id: str | None = None,
+                       cancel_check=None) -> dict:
     """Watch ``url`` and record the ads the platform actually served.
 
-    YouTube links are watched in Chrome (the strategies below). Twitch links are
-    handed to ``twitch_ads``, which reads the stream's own ad markers instead, and
-    the report that comes back has the same shape either way.
+    YouTube links are watched in Chrome (the strategies below). Twitch **live**
+    links go to ``twitch_ads`` (playlist markers, no browser); Twitch **VOD**
+    links are swept in a browser like YouTube, because the recorded player is
+    served ads the same way. Reports share one shape either way.
 
-    Watching strategies:
+    Watching strategies (browser readers):
 
     * ``watch_seconds`` given -- poll for that many seconds (a plain window).
     * ``full_watch=True`` -- play the whole video in real time (exact, slow).
@@ -1119,10 +1253,19 @@ def capture_served_ads(url: str, watch_seconds: float | None = None,
     not watch at all".
     """
     if detect_platform(url) == "twitch":
-        # Twitch ads are stitched into the stream, so they are read from the
-        # stream's own playlist markers rather than from a browser. Imported
-        # here because ``twitch_ads`` reuses this module's proof-report writers.
         import twitch_ads
+
+        # A VOD is a recording with a seekable timeline and a player that is
+        # served ads exactly like YouTube's — so sweep it in a browser. Only
+        # live channels go to the playlist-marker reader.
+        target = twitch_ads.twitch_target(url)
+        if target and target[0] == "vod":
+            return capture_vod_sweep(
+                url, watch_seconds=watch_seconds, headless=headless,
+                proof_dir=proof_dir, record=record, max_seconds=max_seconds,
+                video_id=video_id or target[1], cancel_check=cancel_check,
+                extract_js=_TWITCH_EXTRACT_JS,
+            )
 
         return twitch_ads.capture_twitch_ads(
             url,
@@ -1133,8 +1276,31 @@ def capture_served_ads(url: str, watch_seconds: float | None = None,
             full_watch=full_watch,
             max_seconds=max_seconds,
             video_id=video_id,
+            cancel_check=cancel_check,
         )
 
+    return _capture_youtube_like(
+        url, watch_seconds=watch_seconds, headless=headless,
+        proof_dir=proof_dir, record=record, full_watch=full_watch,
+        max_seconds=max_seconds, video_id=video_id,
+        cancel_check=cancel_check,
+    )
+
+
+def _capture_youtube_like(url: str, watch_seconds: float | None = None,
+                          headless: bool | None = None,
+                          proof_dir: str | None = None,
+                          record: bool | None = None,
+                          full_watch: bool | None = None,
+                          max_seconds: float | None = None,
+                          video_id: str | None = None,
+                          cancel_check=None,
+                          extract_js: str | None = None) -> dict:
+    """The browser reader: watch ``url`` in Chrome and record served ads.
+
+    Used directly for YouTube and (via :func:`capture_vod_sweep`) for Twitch
+    VODs, whose players both serve ads over the video while it plays.
+    """
     result = {
         "available": False,
         "captured": False,
@@ -1185,23 +1351,28 @@ def capture_served_ads(url: str, watch_seconds: float | None = None,
         driver.set_page_load_timeout(45)
         logger.info("Serving ads: opening %s (strategy=%s, budget=%ss)",
                     url, strategy, int(budget))
-        driver.get(url)
+        _load_page(driver, url)
 
         # The clock starts with the page, not with playback: the pre-roll can
         # begin during the load, and those first seconds are evidence.
         started = time.time()
         deadline = started + budget
         tracker = _Tracker(recorder=recorder, driver=driver)
-        _warmup(driver, tracker, deadline, started)
+        _warmup(driver, tracker, deadline, started,
+                cancel_check=cancel_check, extract_js=extract_js)
         _play(driver)
 
         extra: dict = {}
         if strategy == "window":
-            _linear_watch(driver, tracker, deadline, started)
+            _linear_watch(driver, tracker, deadline, started,
+                          cancel_check=cancel_check, extract_js=extract_js)
         elif strategy == "full":
-            _full_watch(driver, tracker, deadline, started)
+            _full_watch(driver, tracker, deadline, started,
+                        cancel_check=cancel_check, extract_js=extract_js)
         else:
-            extra = _sweep_watch(driver, tracker, deadline, started)
+            extra = _sweep_watch(driver, tracker, deadline, started,
+                                 cancel_check=cancel_check, extract_js=extract_js)
+        cancelled = _cancelled(cancel_check)
         tracker.close(time.time() - started)
 
         ads = tracker.ads
@@ -1216,6 +1387,8 @@ def capture_served_ads(url: str, watch_seconds: float | None = None,
         )
         result["index"] = _write_index(recorder, url, ads)
 
+        if cancelled:
+            result["cancelled"] = True
         if ads:
             names = ", ".join(sorted({(a.get("advertiser") or "unknown") for a in ads}))
             note = (
@@ -1228,7 +1401,14 @@ def capture_served_ads(url: str, watch_seconds: float | None = None,
                     f" Pre-roll positions are exact; mid-roll positions are accurate "
                     f"to within the {int(SEEK_STEP_SECONDS)}s seek step."
                 )
+            if cancelled:
+                note += " Capture was stopped early at the user's request."
             result["note"] = note
+        elif cancelled:
+            result["note"] = (
+                f"Capture was stopped after {int(result['watched_seconds'])}s at "
+                "the user's request before any ad was served."
+            )
         else:
             result["note"] = (
                 f"Chrome watched the video for {int(result['watched_seconds'])}s "

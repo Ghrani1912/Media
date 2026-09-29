@@ -71,6 +71,13 @@ before it ends, and a second after — are decoded from whichever segment aired
 then, using ffmpeg. That is stronger evidence than a screenshot: it is the ad's
 own picture, at a known point in its own playback.
 
+**Twitch VODs are a different animal**: the recorded player *is* served ads
+(overlay and all, per-viewer like YouTube), so a `/videos/<id>` link is swept in
+a browser with the same seek-sweep machinery — `strategy: vod-sweep` in the
+report. Live channels keep the playlist-marker reader, which is exact. A live
+watch or a VOD sweep can be stopped at any moment from the UI's STOP button; the
+capture winds down cleanly and says so in its note.
+
 Two things worth knowing about the results:
 
 * A fresh, logged-out session is usually given Twitch's own **"Commercial break in
@@ -223,7 +230,7 @@ proof/
 ## Tests
 
 ```
-mediaenv311/Scripts/python.exe -m pytest -q      # 194 passed
+mediaenv311/Scripts/python.exe -m pytest -q      # 199 passed
 ```
 
 Whisper, yt-dlp, Chrome, ffmpeg and the network are all faked, so the suite runs

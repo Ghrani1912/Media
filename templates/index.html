@@ -372,10 +372,14 @@
 
             </div>
 
-            <button type="submit" id="analyzeBtn" class="btn-analyze" aria-label="Execute media and ad analysis">
-                <span id="btnText">ANALYZE MEDIA &amp; ADS</span>
-            </button>
-            <p id="analyzeStatus" class="control-description" style="text-align:center;" role="status" aria-live="polite">Full sweep + transcription can take minutes — this bar tracks the real stages.</p>
+            <div class="action-row">
+                <button type="submit" id="analyzeBtn" class="btn-analyze" aria-label="Execute media and ad analysis">
+                    <span id="btnText">ANALYZE MEDIA &amp; ADS</span>
+                </button>
+                <button type="button" id="stopJobBtn" class="btn-stop" style="display:none;"
+                        aria-label="Stop the running analysis">■ STOP</button>
+            </div>
+            <p id="analyzeStatus" class="control-description" style="text-align:center;" role="status" aria-live="polite">Full sweep + transcription can take minutes — this bar tracks the real stages. Live captures and the STOP button are for exactly that.</p>
 
         </form>
 
@@ -462,7 +466,30 @@
     // not by timers.
     // ------------------------------------------------------------------
     const analyzerForm = document.getElementById('analyzerForm');
+    const stopBtn = document.getElementById('stopJobBtn');
     let pollTimer = null;
+    let activeJobId = null;
+
+    if (stopBtn) {
+        stopBtn.addEventListener('click', function () {
+            if (!activeJobId) { return; }
+            stopBtn.disabled = true;
+            stopBtn.textContent = 'STOPPING…';
+            fetch('/cancel/' + activeJobId, { method: 'POST' })
+                .then(function (r) { return r.json(); })
+                .then(function (d) {
+                    if (!d.ok) { setAnalyzeStatus('could not stop: ' + (d.error || 'job finished already')); }
+                })
+                .catch(function (e) { setAnalyzeStatus('could not stop: ' + e); });
+        });
+    }
+
+    function showStopBtn(show) {
+        if (!stopBtn) { return; }
+        stopBtn.style.display = show ? 'inline-flex' : 'none';
+        stopBtn.disabled = false;
+        stopBtn.textContent = '■ STOP';
+    }
 
     function setStep(label, percent) {
         const stepLabel = document.getElementById('stepLabel');
@@ -492,6 +519,8 @@
 
     function exitLoadingMode(message) {
         if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+        activeJobId = null;
+        showStopBtn(false);
         if (activeBtn) {
             activeBtn.classList.remove('loading-mode');
             if (activeBtnHTML) { activeBtn.innerHTML = activeBtnHTML; }
@@ -555,6 +584,8 @@
                         exitLoadingMode('REJECTED: ' + (res.data.error || 'bad request'));
                         return;
                     }
+                    activeJobId = res.data.job;
+                    showStopBtn(true);
                     setAnalyzeStatus('job accepted — tracking it');
                     pollJob(res.data.job, Date.now());
                 })

@@ -92,7 +92,7 @@ def patched(monkeypatch, tmp_path):
     monkeypatch.setattr(served_ads, "DEFAULT_PROOF_DIR", str(tmp_path / "proof"))
     monkeypatch.setattr(
         served_ads, "_poll",
-        lambda _driver: script.pop(0) if script else None,
+        lambda _driver, _extract_js=None: script.pop(0) if script else None,
     )
     return script, driver
 
@@ -104,6 +104,103 @@ def test_availability_returns_tuple():
     ok, reason = served_ads.availability()
     assert isinstance(ok, bool)
     assert isinstance(reason, str)
+
+
+# --------------------------------------------------------------------------- #
+# cancellation
+# --------------------------------------------------------------------------- #
+def test_cancel_check_stops_a_watch_window(monkeypatch):
+    fake = _FakeTime()
+    monkeypatch.setattr(served_ads, "time", fake)
+    monkeypatch.setattr(
+        served_ads, "_poll",
+        lambda _d, _js=None: _snap(False, content_time=0.0, content_duration=600.0),
+    )
+
+    ticks = {"n": 0}
+
+    def cancel_after_three():
+        ticks["n"] += 1
+        return ticks["n"] > 3
+
+    tracker = served_ads._Tracker()
+    started = fake.time()
+    served_ads._watch_window(object(), tracker, started + 600.0, started,
+                             500.0, cancel_check=cancel_after_three)
+    assert ticks["n"] <= 5  # bailed out almost immediately after the flag
+
+
+def test_capture_reports_itself_cancelled(patched, monkeypatch):
+    script, _ = patched
+    # Enough content snapshots for the pre-roll window; the cancel flag fires
+    # partway through so the session must end early and say so.
+    script.extend([_snap(False, content_time=0.0, content_duration=600.0)] * 8)
+    state = {"n": 0}
+
+    def cancel_soon():
+        state["n"] += 1
+        return state["n"] > 5
+
+    report = served_ads.capture_served_ads(
+        "https://youtu.be/x", watch_seconds=500, record=False,
+        cancel_check=cancel_soon)
+    assert report.get("cancelled") is True
+    assert "stopped" in report["note"].lower()
+
+
+# --------------------------------------------------------------------------- #
+# Twitch VOD browser sweep
+# --------------------------------------------------------------------------- #
+def test_twitch_vod_uses_the_browser_sweep(patched, monkeypatch):
+    script, driver = patched
+    # Pre-roll window snapshots, then a duration so the sweep seeks; one ad at
+    # the first stop proves the tracker read the Twitch player overlay.
+    script.append(_snap(False, content_time=0.0, content_duration=600.0))
+    script.append(_snap(True, "Acme", "acme.com", content_time=120.0,
+                        content_duration=600.0, duration=15.0, ad_time=0.1))
+    script.extend([_snap(False, content_time=120.0, content_duration=600.0)] * 8)
+
+    used_js = {}
+    real_poll = served_ads._poll
+
+    def spy_poll(driver, extract_js=None):
+        used_js["value"] = extract_js
+        return real_poll(driver, extract_js)
+
+    monkeypatch.setattr(served_ads, "_poll", spy_poll)
+
+    report = served_ads.capture_served_ads(
+        "https://www.twitch.tv/videos/2886229732", watch_seconds=60,
+        record=False)
+    assert report["strategy"] == "vod-sweep"
+    assert report["source"] == "vod-browser"
+    assert report["captured"] is True
+    assert report["ad_count"] == 1
+    assert report["ads"][0]["advertiser"] == "Acme"
+    assert used_js["value"] is served_ads._TWITCH_EXTRACT_JS
+
+
+def test_twitch_live_still_uses_playlist_markers(patched, monkeypatch):
+    import twitch_ads
+
+    handed = {}
+    monkeypatch.setattr(twitch_ads, "capture_twitch_ads",
+                        lambda url, **kw: handed.update(kw) or {
+                            "available": True, "captured": False,
+                            "ad_count": 0, "ads": [], "note": "live",
+                            "strategy": "live", "source": "stream-markers"})
+    report = served_ads.capture_served_ads("https://www.twitch.tv/gon_vl")
+    assert report["strategy"] == "live"
+    assert "cancel_check" in handed  # the stop button reaches the live watcher too
+
+
+def test_vod_sweep_note_when_no_ads_served(patched):
+    report = served_ads.capture_vod_sweep(
+        "https://www.twitch.tv/videos/2886229732", watch_seconds=30,
+        record=False)
+    assert report["strategy"] == "vod-sweep"
+    assert report["captured"] is False
+    assert "served no ad" in report["note"]
 
 
 def test_capture_reports_unavailable_without_raising(monkeypatch):
@@ -329,7 +426,7 @@ def test_sweep_watch_seeks_across_the_whole_timeline(monkeypatch):
     monkeypatch.setattr(served_ads, "_seek", lambda driver, pos: seeks.append(pos))
     monkeypatch.setattr(
         served_ads, "_poll",
-        lambda _d: _snap(False, content_time=0.0, content_duration=360.0),
+        lambda _d, _js=None: _snap(False, content_time=0.0, content_duration=360.0),
     )
 
     tracker = served_ads._Tracker()
@@ -352,7 +449,7 @@ def test_sweep_stays_put_until_a_served_ad_finishes(monkeypatch):
 
     seen = {"n": 0}
 
-    def _poll(_driver):
+    def _poll(_driver, _js=None):
         seen["n"] += 1
         # an ad that outlasts the plain dwell window, then content resumes
         return _snap(seen["n"] <= 8, "Acme", "acme.com", content_time=120.0,
@@ -374,7 +471,7 @@ def test_watch_window_gives_up_on_an_ad_that_never_finishes(monkeypatch):
     monkeypatch.setattr(served_ads, "AD_WAIT_SECONDS", 6.0)
     monkeypatch.setattr(
         served_ads, "_poll",
-        lambda _d: _snap(True, "Acme", "acme.com", content_time=0.0,
+        lambda _d, _js=None: _snap(True, "Acme", "acme.com", content_time=0.0,
                          duration=30.0, paused=True),
     )
     plays = []
@@ -403,7 +500,7 @@ def test_sweep_marks_seek_triggered_ads_as_midroll(monkeypatch):
     monkeypatch.setattr(served_ads, "_seek", lambda driver, pos: None)
     queue = [_snap(False, content_time=0.0, content_duration=600.0)]
     monkeypatch.setattr(served_ads, "_poll",
-                        lambda _d: queue.pop(0) if queue else _snap(
+                        lambda _d, _js=None: queue.pop(0) if queue else _snap(
                             False, content_time=0.0, content_duration=600.0))
 
     started = fake.time()
@@ -611,7 +708,7 @@ def test_warmup_films_the_opening_and_retries_a_late_consent_dialog(tmp_path, mo
     tracker = served_ads._Tracker(recorder=recorder, driver=driver)
     monkeypatch.setattr(
         served_ads, "_poll",
-        lambda _d: _snap(False, content_time=0.0, rect=None),
+        lambda _d, _js=None: _snap(False, content_time=0.0, rect=None),
     )
 
     started = fake.time()

@@ -19,7 +19,8 @@ from flask import (Flask, abort, jsonify, redirect, render_template, request,
 from werkzeug.utils import secure_filename
 
 import served_ads
-from process import REPORT_PATH, WHISPER_MODEL, pop_stage, process_video
+from process import (REPORT_PATH, WHISPER_MODEL, cancel_requested, pop_stage,
+                     process_video, request_cancel)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_FOLDER = os.path.join(BASE_DIR, "uploads")
@@ -183,10 +184,15 @@ def _run_job(job_id: str, **kwargs) -> None:
         with app.app_context():  # render_template needs a context; threads don't get one
             result = process_video(job_id=job_id, **kwargs)
             result["title"] = _display_title(kwargs.get("link"), file_path)
-            html = render_template(
-                "index.html", result=result,
-                selected_model=kwargs.get("model_name") or WHISPER_MODEL)
-            state, summary = "done", result
+            if result.get("cancelled"):
+                state, error = "cancelled", "Analysis stopped at your request."
+                html = render_template("index.html", error=error)
+                summary = result
+            else:
+                state, summary = "done", result
+                html = render_template(
+                    "index.html", result=result,
+                    selected_model=kwargs.get("model_name") or WHISPER_MODEL)
     except Exception as exc:  # the page must show the reason, not spin forever
         logger.exception("Job %s failed", job_id)
         error = str(exc)
@@ -259,6 +265,18 @@ def analyze():
     return jsonify({"job": job_id})
 
 
+@app.post("/cancel/<job_id>")
+def cancel(job_id: str):
+    """Ask a running job to stop; the worker checks between steps."""
+    with _JOBS_LOCK:
+        job = _JOBS.get(job_id)
+        if job is None or job["state"] != "running":
+            return jsonify({"ok": False, "error": "unknown or finished job"}), 404
+        job["cancelling"] = True
+    request_cancel(job_id)
+    return jsonify({"ok": True})
+
+
 @app.get("/status/<job_id>")
 def job_status(job_id: str):
     """Poll a job: pipeline stage while running, the rendered page when done."""
@@ -269,11 +287,18 @@ def job_status(job_id: str):
         state = job["state"]
         error = job["error"]
         html = job["html"]
+        cancelling = job.get("cancelling", False)
 
+    if state == "cancelled":
+        return jsonify({"state": "error", "error": error, "html": html})
     if state == "done":
         return jsonify({"state": "done", "html": html})
     if state == "error":
         return jsonify({"state": "error", "error": error, "html": html})
+    if cancelling:
+        return jsonify({"state": "running", "stage": "cancel",
+                        "label": "STOPPING…", "percent": 100.0,
+                        "detail": "finishing the current step, then winding down"})
 
     stage_info = _pop_unseen_stage(job_id)
     stage = (stage_info or {}).get("stage") or "fetch"
